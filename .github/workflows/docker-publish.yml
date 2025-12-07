@@ -11,7 +11,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: agentgenesis/agent-genesis
+  IMAGE_NAME: platano78/agent-genesis
 
 jobs:
   build-and-push:
