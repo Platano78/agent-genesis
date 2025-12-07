@@ -1,0 +1,73 @@
+[project]
+name = "agent-genesis-mcp"
+version = "1.2.0"
+description = "MCP server for searching Claude Code conversation history via Agent Genesis"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Agent Genesis Contributors"}
+]
+keywords = [
+    "mcp",
+    "claude",
+    "claude-code",
+    "conversation-history",
+    "semantic-search",
+    "ai-assistant"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.3.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/agentgenesis/agent-genesis"
+Documentation = "https://github.com/agentgenesis/agent-genesis#readme"
+Repository = "https://github.com/agentgenesis/agent-genesis"
+Issues = "https://github.com/agentgenesis/agent-genesis/issues"
+
+[project.scripts]
+agent-genesis-mcp = "agent_genesis_mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "*.py",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]

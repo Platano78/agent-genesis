@@ -1,0 +1,156 @@
+# Agent Genesis .gitignore
+
+# =============================================================================
+# Environment & Secrets (NEVER commit these)
+# =============================================================================
+.env
+.env.local
+.env.*.local
+config/scheduler.json
+
+# =============================================================================
+# Personal/Local Files (DO NOT share these)
+# =============================================================================
+docker-compose.yml
+docker-compose.override.yml
+backup-container-config.json
+backup-container-status.txt
+backup-volume-config.json
+start-phase2.sh
+validate-phase2.sh
+
+# Old migration/upgrade files (personal paths)
+UPGRADE_REPORT.md
+MIGRATION_QUICK_REFERENCE.md
+MIGRATION_DOCUMENTATION_INDEX.md
+FINAL_UPGRADE_STATUS.md
+UPGRADE_SUMMARY.txt
+UPGRADE_COMPLETE.txt
+FILES_CREATED.txt
+requirements.backup.*.txt
+requirements.post-upgrade.*.txt
+agent_genesis_assessment.md
+
+# MCP server local config files
+mcp-server/claude_desktop_config.json
+mcp-server/compliance_report.json
+mcp-server/install.sh
+
+# Old src directory
+src/
+
+# Test and validation files with personal data
+test_import.py
+import_to_container.py
+validate_upgrade.py
+test_scheduler.py
+
+# Local scripts with hardcoded paths
+scripts/backup-chromadb.sh
+scripts/schedule_indexer.py
+scripts/health-check.sh
+
+# Personal documentation
+AGENT_GENESIS_COMPREHENSIVE_ANALYSIS.md
+AGENT_GENESIS_EXECUTIVE_SUMMARY.txt
+AGENT_GENESIS_AUTO_INDEXING_SETUP.md
+PHASE2_DEPLOYMENT.md
+SCHEDULER_README.md
+SCHEDULER_IMPLEMENTATION_SUMMARY.md
+SCHEDULER_QUICKREF.md
+QUICK_REFERENCE.md
+MCP_USAGE_GUIDE.md
+CHROMADB_FIX_REPORT_20251129.txt
+
+# Claude local settings
+.claude/
+
+# Docker knowledge data (user-specific indexed data)
+docker-knowledge/
+
+# Backup files
+*.backup.*
+
+# Windows PowerShell scripts (local automation)
+scripts/*.ps1
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# =============================================================================
+# Data & Databases (user-specific)
+# =============================================================================
+knowledge_db/
+data/
+*.db
+*.sqlite
+*.sqlite3
+backups/
+logs/
+*.log
+
+# =============================================================================
+# IDE & Editor
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# Docker
+# =============================================================================
+docker-compose.yml
+docker-compose.override.yml
+
+# =============================================================================
+# Build artifacts
+# =============================================================================
+*.zip
+build.log
+*.bak
+
+# =============================================================================
+# Test artifacts
+# =============================================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =============================================================================
+# Zone identifiers (Windows)
+# =============================================================================
+*:Zone.Identifier

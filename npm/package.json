@@ -1,0 +1,36 @@
+{
+  "name": "@agent-genesis/claude-config",
+  "version": "1.0.0",
+  "description": "Configure Claude Code/Desktop to use Agent Genesis MCP server",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "agent-genesis",
+    "conversation-search",
+    "ai-assistant"
+  ],
+  "homepage": "https://github.com/agentgenesis/agent-genesis#readme",
+  "bugs": {
+    "url": "https://github.com/agentgenesis/agent-genesis/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentgenesis/agent-genesis.git"
+  },
+  "license": "MIT",
+  "author": "Agent Genesis Contributors",
+  "main": "bin/setup.js",
+  "bin": {
+    "agent-genesis-config": "bin/setup.js"
+  },
+  "files": [
+    "bin/"
+  ],
+  "scripts": {
+    "postinstall": "node bin/setup.js --check-only || echo 'Run: npx agent-genesis-config setup'"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

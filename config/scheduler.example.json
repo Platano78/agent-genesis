@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "frequency_minutes": 30,
+  "last_run": null,
+  "task_name": "GenesisAutoIndex",
+  "created_at": null,
+  "updated_at": null
+}
