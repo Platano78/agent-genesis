@@ -1,5 +1,5 @@
 {
-  "name": "@agent-genesis/claude-config",
+  "name": "agent-genesis-config",
   "version": "1.0.0",
   "description": "Configure Claude Code/Desktop to use Agent Genesis MCP server",
   "keywords": [
