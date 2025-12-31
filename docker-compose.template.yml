@@ -50,14 +50,20 @@ services:
     networks:
       - agent-genesis-network
 
+    # Resource limits - IMPORTANT for stability
+    # ChromaDB + sentence-transformers + FastAPI requires ~3.5GB baseline
+    # 6GB limit provides headroom for indexing operations
+    mem_limit: 6g
+    memswap_limit: 8g
+
     deploy:
       resources:
         limits:
           cpus: '2.0'
-          memory: 4G
+          memory: 6G
         reservations:
           cpus: '1.0'
-          memory: 2G
+          memory: 3G
 
     logging:
       driver: "json-file"

@@ -46,9 +46,8 @@ validate_upgrade.py
 test_scheduler.py
 
 # Local scripts with hardcoded paths
-scripts/backup-chromadb.sh
 scripts/schedule_indexer.py
-scripts/health-check.sh
+# Note: health-check.sh and backup-chromadb.sh now use relative paths
 
 # Personal documentation
 AGENT_GENESIS_COMPREHENSIVE_ANALYSIS.md
