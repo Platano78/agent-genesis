@@ -4,6 +4,7 @@
 
 Agent Genesis indexes and searches your Claude Code and Claude Desktop conversations, making it easy to find past discussions, decisions, and solutions.
 
+![Version](https://img.shields.io/badge/version-1.1.0-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-required-blue.svg)
@@ -16,6 +17,17 @@ Agent Genesis indexes and searches your Claude Code and Claude Desktop conversat
 - 🐳 **Docker Deployment** - Easy setup with Docker Compose
 - ⚡ **Fast Indexing** - ChromaDB-powered vector search
 - 📊 **Statistics** - Track your indexed conversations
+
+## System Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| **Memory** | 4GB | 6GB+ |
+| **Disk** | 2GB | 5GB+ |
+| **Docker** | 20.10+ | Latest |
+| **Python** | 3.10+ | 3.11+ |
+
+> **Note**: ChromaDB + sentence-transformers require ~3.5GB baseline memory. The default configuration allocates 6GB to prevent OOM issues during indexing operations.
 
 ## Quick Start
 
@@ -177,6 +189,47 @@ curl -X POST http://localhost:8080/index/trigger
 - **No telemetry**: ChromaDB telemetry is disabled
 - **Your data, your control**: Delete the Docker volume to remove all indexed data
 
+## Health Monitoring
+
+Agent Genesis includes scripts for monitoring container health and preventing issues.
+
+### Health Check Script
+
+Run every 5 minutes via cron to ensure the service stays healthy:
+
+```bash
+# Add to crontab
+*/5 * * * * /path/to/agent-genesis/scripts/health-check.sh
+```
+
+Features:
+- Automatic container restart if unhealthy
+- Memory usage monitoring (alerts at 80% threshold)
+- Automatic backup trigger if daily backup is missing
+
+### Memory Alert Script
+
+Standalone memory monitoring with configurable threshold:
+
+```bash
+# Check memory (default 80% threshold)
+./scripts/memory-alert.sh
+
+# Custom threshold
+./scripts/memory-alert.sh 70
+```
+
+### Backup Script
+
+Daily ChromaDB backup with rotation:
+
+```bash
+# Add to crontab for daily 2 AM backup
+0 2 * * * /path/to/agent-genesis/scripts/backup-chromadb.sh
+```
+
+Backups are stored in `./backups/` with 7-day retention.
+
 ## Troubleshooting
 
 ### API not responding
@@ -237,6 +290,23 @@ Contributions are welcome! Please:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Changelog
+
+### v1.1.0 (2024-12-31)
+- **Memory**: Increased container memory limit from 4GB to 6GB
+- **Stability**: Added `mem_limit`/`memswap_limit` for better OOM prevention
+- **Monitoring**: Added health check script with memory monitoring
+- **Monitoring**: Added standalone memory alert script
+- **Backup**: Added automated ChromaDB backup script with rotation
+- **Portability**: All scripts now use relative paths
+
+### v1.0.0 (2024-11-02)
+- Initial release
+- Semantic search for Claude Code and Claude Desktop conversations
+- MCP integration for use within Claude Code
+- Docker-based deployment
+- REST API for search and indexing
 
 ## Acknowledgments
 
