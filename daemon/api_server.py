@@ -139,12 +139,84 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json_response({"error": str(e)}, status=500)
 
     def handle_health(self):
-        """Handle health check request."""
-        self.send_json_response({
+        """Handle health check request with deep validation."""
+        health_status = {
             "status": "OK",
             "api": "Agent Genesis Phase 2",
-            "endpoints": ["/search", "/index/trigger", "/stats", "/health"]
-        })
+            "endpoints": ["/search", "/index/trigger", "/stats", "/health"],
+            "warnings": []
+        }
+        
+        try:
+            # Deep health check: verify ChromaDB can actually query
+            if self.db:
+                import os
+                
+                # Check collection counts
+                alpha_count = self.db.alpha_collection.count()
+                beta_count = self.db.beta_collection.count()
+                health_status["collections"] = {
+                    "alpha": alpha_count,
+                    "beta": beta_count,
+                    "total": alpha_count + beta_count
+                }
+                
+                # Check disk usage
+                persist_dir = self.db.persist_directory
+                if os.path.exists(persist_dir):
+                    total_size = 0
+                    hnsw_size = 0
+                    for root, dirs, files in os.walk(persist_dir):
+                        for f in files:
+                            fpath = os.path.join(root, f)
+                            try:
+                                size = os.path.getsize(fpath)
+                                total_size += size
+                                if f == "link_lists.bin":
+                                    hnsw_size = size
+                            except OSError:
+                                pass
+                    
+                    health_status["disk"] = {
+                        "total_mb": round(total_size / (1024 * 1024), 2),
+                        "hnsw_mb": round(hnsw_size / (1024 * 1024), 2)
+                    }
+                    
+                    # Warning if HNSW index is suspiciously large (>1GB)
+                    if hnsw_size > 1024 * 1024 * 1024:
+                        health_status["warnings"].append(
+                            f"HNSW index is large: {round(hnsw_size / (1024**3), 2)}GB - possible corruption"
+                        )
+                        health_status["status"] = "DEGRADED"
+                    
+                    # Warning if total size > 5GB
+                    if total_size > 5 * 1024 * 1024 * 1024:
+                        health_status["warnings"].append(
+                            f"Database is large: {round(total_size / (1024**3), 2)}GB"
+                        )
+                
+                # Test actual query capability (quick sanity check)
+                try:
+                    test_results = self.db.alpha_collection.query(
+                        query_texts=["test"],
+                        n_results=1
+                    )
+                    health_status["query_test"] = "PASS"
+                except Exception as e:
+                    health_status["query_test"] = "FAIL"
+                    health_status["warnings"].append(f"Query test failed: {str(e)[:100]}")
+                    health_status["status"] = "UNHEALTHY"
+            
+            if not health_status["warnings"]:
+                del health_status["warnings"]
+                
+        except Exception as e:
+            health_status["status"] = "UNHEALTHY"
+            health_status["error"] = str(e)[:200]
+            logger.error(f"Health check failed: {e}")
+        
+        status_code = 200 if health_status["status"] == "OK" else 503 if health_status["status"] == "UNHEALTHY" else 200
+        self.send_json_response(health_status, status=status_code)
 
     def handle_stats(self):
         """Handle collection statistics request."""

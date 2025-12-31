@@ -33,9 +33,9 @@ ENV APP_MODE=phase2
 # Expose API port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD curl -f http://localhost:8080/health || exit 1
+# Health check - validates query capability, not just HTTP response
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+  CMD curl -sf http://localhost:8080/health | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='OK' and d.get('query_test')=='PASS' else 1)" || exit 1
 
 # Entry point with mode switching
 CMD if [ "$APP_MODE" = "phase2" ]; then \
