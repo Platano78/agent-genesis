@@ -64,6 +64,9 @@ CHROMADB_FIX_REPORT_20251129.txt
 # Claude local settings
 .claude/
 
+# Serena local settings
+.serena/
+
 # Docker knowledge data (user-specific indexed data)
 docker-knowledge/
 

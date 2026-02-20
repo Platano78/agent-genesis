@@ -2,15 +2,17 @@
 Phase 2: API server for semantic search and indexing endpoints.
 
 Provides REST API for:
-- Semantic search across conversation history
+- Full-text + semantic search across conversation history
 - Manual indexing triggers
 - Collection statistics
+- Health monitoring
 """
 
 import json
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
+import os
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 from typing import Optional
 
 try:
@@ -23,17 +25,91 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _build_endpoints_list() -> list:
+    return ["/search", "/index/trigger", "/stats", "/live", "/ready", "/health", "/health/deep"]
+
+
+def _collect_disk_stats(persist_dir: str) -> tuple:
+    if not os.path.exists(persist_dir):
+        return None, 0, 0
+
+    total_size = 0
+    hnsw_size = 0
+    for root, dirs, files in os.walk(persist_dir):
+        for f in files:
+            fpath = os.path.join(root, f)
+            try:
+                size = os.path.getsize(fpath)
+                total_size += size
+                if f in ("data_level0.bin", "link_lists.bin", "length.bin"):
+                    hnsw_size += size
+            except OSError:
+                pass
+
+    disk = {
+        "total_mb": round(total_size / (1024 * 1024), 2),
+        "hnsw_mb": round(hnsw_size / (1024 * 1024), 2),
+    }
+    return disk, total_size, hnsw_size
+
+
+def _run_deep_check(db) -> dict:
+    """On-demand deep check — SQLite stats + disk + search test."""
+    health_status = {
+        "status": "OK",
+        "api": "Agent Genesis Phase 2",
+        "endpoints": _build_endpoints_list(),
+        "warnings": [],
+    }
+
+    try:
+        if db:
+            _col_stats = db.get_collection_stats()
+            alpha_count = _col_stats.get("alpha", {}).get("count", 0)
+            beta_count = _col_stats.get("beta", {}).get("count", 0)
+            health_status["collections"] = {
+                "alpha": alpha_count,
+                "beta": beta_count,
+                "total": alpha_count + beta_count,
+            }
+
+            # Run actual search test
+            search_test = db.test_search()
+            health_status["query_test"] = search_test.get("status", "UNKNOWN")
+            if search_test.get("status") != "PASS":
+                health_status["warnings"].append(
+                    f"Search test failed: {search_test.get('error', 'unknown')}"
+                )
+
+            disk, total_size, hnsw_size = _collect_disk_stats(db.persist_directory)
+            if disk:
+                health_status["disk"] = disk
+                if total_size > 5 * 1024 * 1024 * 1024:
+                    health_status["warnings"].append(
+                        f"Database is large: {round(total_size / (1024**3), 2)}GB"
+                    )
+        else:
+            health_status["status"] = "UNHEALTHY"
+            health_status["error"] = "Database is not initialized"
+
+        if not health_status["warnings"]:
+            del health_status["warnings"]
+    except Exception as e:
+        health_status["status"] = "UNHEALTHY"
+        health_status["error"] = str(e)[:200]
+        logger.error("Deep health check failed: %s", e)
+
+    return health_status
+
+
 class APIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for Agent Genesis API."""
 
-    # Class variables to store database and indexer
     db: Optional[DualSourceKnowledgeDB] = None
     indexer: Optional[ConversationIndexer] = None
 
     def do_POST(self):
-        """Handle POST requests."""
         path = urlparse(self.path).path
-
         if path == '/search':
             self.handle_search()
         elif path == '/index/trigger':
@@ -42,181 +118,148 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Endpoint not found")
 
     def do_GET(self):
-        """Handle GET requests."""
         path = urlparse(self.path).path
-
-        if path == '/health':
+        if path == '/live':
+            self.handle_live()
+        elif path == '/ready':
+            self.handle_ready()
+        elif path == '/health':
             self.handle_health()
+        elif path == '/health/deep':
+            self.handle_health_deep()
         elif path == '/stats':
             self.handle_stats()
         else:
             self.send_error(404, "Endpoint not found")
 
     def handle_search(self):
-        """
-        Handle semantic search request.
-
-        POST /search
-        {
-            "query": "pathfinding algorithms",
-            "n_results": 10,
-            "project_filter": "empires_edge",  // optional
-            "collections": ["alpha", "beta"]    // optional
-        }
-        """
+        """Handle search request (FTS5 + optional vector search)."""
         try:
-            # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
             data = json.loads(body)
-
             query_text = data.get('query')
             if not query_text:
                 self.send_json_response({"error": "query parameter required"}, status=400)
                 return
-
-            n_results = data.get('n_results', 10)
-            project_filter = data.get('project_filter')
+            n_results = data.get('n_results', data.get('limit', 10))
+            project_filter = data.get('project_filter', data.get('project'))
             collections = data.get('collections', ["alpha", "beta"])
 
-            # Perform unified search
-            results = self.db.query_unified(
+            result = self.db.query_unified(
                 query_text=query_text,
                 n_results=n_results,
                 collections=collections,
-                project_filter=project_filter
+                project_filter=project_filter,
             )
 
+            # Unpack result dict from query_unified
+            results_list = result.get("results", [])
             self.send_json_response({
                 "query": query_text,
-                "results_count": len(results),
-                "results": results
+                "results_count": len(results_list),
+                "results": results_list,
+                "search_type": result.get("search_type", "unknown"),
             })
-
         except json.JSONDecodeError:
             self.send_json_response({"error": "Invalid JSON"}, status=400)
         except Exception as e:
-            logger.error(f"Search failed: {e}")
+            logger.error("Search failed: %s", e)
             self.send_json_response({"error": str(e)}, status=500)
 
     def handle_index_trigger(self):
-        """
-        Handle manual indexing trigger.
-
-        POST /index/trigger
-        {
-            "sources": ["alpha", "beta"],  // optional
-            "enable_mkg": false              // optional
-        }
-        """
+        """Handle manual indexing trigger."""
         try:
-            # Read request body (optional)
             content_length = int(self.headers.get('Content-Length', 0))
             if content_length > 0:
                 body = self.rfile.read(content_length).decode('utf-8')
                 data = json.loads(body)
             else:
                 data = {}
-
             enable_mkg = data.get('enable_mkg', False)
-
-            # Create fresh indexer instance
             indexer = ConversationIndexer(enable_mkg_analysis=enable_mkg)
             stats = indexer.index_all_sources()
-
             self.send_json_response({
                 "status": "complete",
                 "stats": {
                     "alpha_indexed": stats["alpha_indexed"],
                     "beta_indexed": stats["beta_indexed"],
                     "total_indexed": stats["total_indexed"],
-                    "duration_seconds": stats["duration"]
-                }
+                    "duration_seconds": stats["duration"],
+                },
             })
-
         except Exception as e:
-            logger.error(f"Indexing trigger failed: {e}")
+            logger.error("Indexing trigger failed: %s", e)
             self.send_json_response({"error": str(e)}, status=500)
 
-    def handle_health(self):
-        """Handle health check request with deep validation."""
-        health_status = {
+    def handle_live(self):
+        """Ultra-cheap liveness check. No DB calls. Always <1ms."""
+        self.send_json_response({"status": "ok", "api": "Agent Genesis Phase 2"})
+
+    def handle_ready(self):
+        """Readiness check: fast SQLite stats + disk usage."""
+        if self.db is None:
+            self.send_json_response(
+                {
+                    "status": "UNHEALTHY",
+                    "api": "Agent Genesis Phase 2",
+                    "endpoints": _build_endpoints_list(),
+                    "error": "Database is not initialized",
+                },
+                status=503,
+            )
+            return
+
+        readiness = {
             "status": "OK",
             "api": "Agent Genesis Phase 2",
-            "endpoints": ["/search", "/index/trigger", "/stats", "/health"],
-            "warnings": []
+            "endpoints": _build_endpoints_list(),
+            "warnings": [],
         }
-        
+
         try:
-            # Deep health check: verify ChromaDB can actually query
-            if self.db:
-                import os
-                
-                # Check collection counts
-                alpha_count = self.db.alpha_collection.count()
-                beta_count = self.db.beta_collection.count()
-                health_status["collections"] = {
-                    "alpha": alpha_count,
-                    "beta": beta_count,
-                    "total": alpha_count + beta_count
-                }
-                
-                # Check disk usage
-                persist_dir = self.db.persist_directory
-                if os.path.exists(persist_dir):
-                    total_size = 0
-                    hnsw_size = 0
-                    for root, dirs, files in os.walk(persist_dir):
-                        for f in files:
-                            fpath = os.path.join(root, f)
-                            try:
-                                size = os.path.getsize(fpath)
-                                total_size += size
-                                if f == "link_lists.bin":
-                                    hnsw_size = size
-                            except OSError:
-                                pass
-                    
-                    health_status["disk"] = {
-                        "total_mb": round(total_size / (1024 * 1024), 2),
-                        "hnsw_mb": round(hnsw_size / (1024 * 1024), 2)
-                    }
-                    
-                    # Warning if HNSW index is suspiciously large (>1GB)
-                    if hnsw_size > 1024 * 1024 * 1024:
-                        health_status["warnings"].append(
-                            f"HNSW index is large: {round(hnsw_size / (1024**3), 2)}GB - possible corruption"
-                        )
-                        health_status["status"] = "DEGRADED"
-                    
-                    # Warning if total size > 5GB
-                    if total_size > 5 * 1024 * 1024 * 1024:
-                        health_status["warnings"].append(
-                            f"Database is large: {round(total_size / (1024**3), 2)}GB"
-                        )
-                
-                # Test actual query capability (quick sanity check)
-                try:
-                    test_results = self.db.alpha_collection.query(
-                        query_texts=["test"],
-                        n_results=1
+            _col_stats = self.db.get_collection_stats()
+            alpha_count = _col_stats.get("alpha", {}).get("count", 0)
+            beta_count = _col_stats.get("beta", {}).get("count", 0)
+            readiness["collections"] = {
+                "alpha": alpha_count,
+                "beta": beta_count,
+                "total": alpha_count + beta_count,
+            }
+
+            disk, total_size, hnsw_size = _collect_disk_stats(self.db.persist_directory)
+            if disk:
+                readiness["disk"] = disk
+                if total_size > 5 * 1024 * 1024 * 1024:
+                    readiness["warnings"].append(
+                        f"Database is large: {round(total_size / (1024**3), 2)}GB"
                     )
-                    health_status["query_test"] = "PASS"
-                except Exception as e:
-                    health_status["query_test"] = "FAIL"
-                    health_status["warnings"].append(f"Query test failed: {str(e)[:100]}")
-                    health_status["status"] = "UNHEALTHY"
-            
-            if not health_status["warnings"]:
-                del health_status["warnings"]
-                
+
+            if not readiness["warnings"]:
+                del readiness["warnings"]
+
+            self.send_json_response(readiness)
         except Exception as e:
-            health_status["status"] = "UNHEALTHY"
-            health_status["error"] = str(e)[:200]
-            logger.error(f"Health check failed: {e}")
-        
-        status_code = 200 if health_status["status"] == "OK" else 503 if health_status["status"] == "UNHEALTHY" else 200
-        self.send_json_response(health_status, status=status_code)
+            logger.error("Readiness check failed: %s", e)
+            self.send_json_response(
+                {
+                    "status": "UNHEALTHY",
+                    "api": "Agent Genesis Phase 2",
+                    "endpoints": _build_endpoints_list(),
+                    "error": str(e)[:200],
+                },
+                status=503,
+            )
+
+    def handle_health(self):
+        """Backwards-compatible /health — same as /ready."""
+        self.handle_ready()
+
+    def handle_health_deep(self):
+        """Run full deep health check including search test."""
+        result = _run_deep_check(self.db)
+        status_code = 503 if result.get("status") == "UNHEALTHY" else 200
+        self.send_json_response(result, status=status_code)
 
     def handle_stats(self):
         """Handle collection statistics request."""
@@ -224,47 +267,39 @@ class APIHandler(BaseHTTPRequestHandler):
             stats = self.db.get_collection_stats()
             self.send_json_response(stats)
         except Exception as e:
-            logger.error(f"Stats retrieval failed: {e}")
+            logger.error("Stats retrieval failed: %s", e)
             self.send_json_response({"error": str(e)}, status=500)
 
     def send_json_response(self, data: dict, status: int = 200):
-        """Send JSON response."""
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def log_message(self, format, *args):
-        """Log HTTP requests."""
-        logger.info(f"{self.address_string()} - {format % args}")
+        logger.info("%s - %s", self.address_string(), format % args)
 
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8080):
-    """
-    Start the API server.
-
-    Args:
-        host: Host to bind to
-        port: Port to listen on
-    """
-    # Initialize shared resources
+    """Start the API server."""
     APIHandler.db = DualSourceKnowledgeDB()
     logger.info("API server initialized with DualSourceKnowledgeDB")
 
-    # Create and start server
-    server = HTTPServer((host, port), APIHandler)
-    logger.info(f"Agent Genesis API server listening on {host}:{port}")
+    server = ThreadingHTTPServer((host, port), APIHandler)
+    logger.info("Agent Genesis API server listening on %s:%d", host, port)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down API server...")
+        if APIHandler.db:
+            APIHandler.db.shutdown()
         server.server_close()
 
 
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
     start_api_server()

@@ -26,7 +26,7 @@ mcp = FastMCP(
 
 # API configuration
 API_BASE_URL = "http://localhost:8080"
-API_TIMEOUT = 10  # seconds
+API_TIMEOUT = 60  # seconds
 
 
 @mcp.tool
@@ -59,11 +59,11 @@ def search_conversations(
         # Build request payload
         payload = {
             "query": query,
-            "limit": limit
+            "n_results": limit
         }
 
         if project:
-            payload["project"] = project
+            payload["project_filter"] = project
 
         # Call Agent Genesis API
         logger.info(f"Searching for: {query} (limit={limit}, project={project})")
@@ -76,12 +76,9 @@ def search_conversations(
         response.raise_for_status()
         data = response.json()
 
-        # Extract nested results structure
-        # API returns: {"results": {"results": [...]}}
-        api_results = data.get("results", {})
-        if isinstance(api_results, dict):
-            results_list = api_results.get("results", [])
-        else:
+        # API returns: {"results": [...], "results_count": N, "search_type": "..."}
+        results_list = data.get("results", [])
+        if not isinstance(results_list, list):
             results_list = []
 
         # Format results for better readability
@@ -194,7 +191,7 @@ def check_api_health() -> dict:
     try:
         response = requests.get(
             f"{API_BASE_URL}/health",
-            timeout=5
+            timeout=10
         )
         response.raise_for_status()
         data = response.json()
@@ -393,7 +390,7 @@ def get_stats_resource() -> str:
 def get_health_resource() -> str:
     """Get API health status as a resource."""
     try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=5)
+        response = requests.get(f"{API_BASE_URL}/health", timeout=10)
         response.raise_for_status()
         data = response.json()
         import json

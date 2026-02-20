@@ -1,22 +1,25 @@
 """Dual-collection knowledge database for multi-source conversation indexing.
 
-This module provides a ChromaDB-based knowledge database that supports two distinct
-data sources (JSON and LevelDB) with unified semantic search capabilities.
+This module provides search across two distinct data sources (JSON and LevelDB)
+using a hybrid approach:
+  - SQLite FTS5 for fast full-text search across all collections (primary)
+  - ChromaDB vector search for semantic search on small collections (secondary)
+
+The ChromaDB worker subprocess isolates Rust binding crashes from the API server.
 """
 
-import os
 import json
+import os
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
 import uuid
-from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 import logging
 
-import chromadb
-from chromadb.config import Settings
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
-
-# Set up logging
 logger = logging.getLogger(__name__)
 handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
@@ -25,541 +28,538 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 
-class DualSourceKnowledgeDB:
+# ---------------------------------------------------------------------------
+# FTS5 Search Engine — primary search path, no ChromaDB dependency
+# ---------------------------------------------------------------------------
+
+class FTSSearchEngine:
+    """Full-text search over ChromaDB's SQLite database using FTS5.
+
+    ChromaDB stores documents in SQLite with an FTS5 index. We query it
+    directly for fast, reliable text search without touching the HNSW
+    index (which segfaults on large collections).
     """
-    A dual-collection knowledge base system supporting JSON and LevelDB sources,
-    indexed in ChromaDB with semantic querying and metadata filtering.
-    
-    The database maintains two separate collections:
-    - alpha_claude_code: For JSON-based conversation sources
-    - beta_claude_desktop: For LevelDB-based conversation sources
-    
-    Features:
-    - Automatic source detection from metadata
-    - Unified semantic search across both collections
-    - Per-message indexing with rich metadata
-    - Collection statistics and monitoring
-    - Distance-based result ranking
+
+    _SEARCH_SQL = """
+        SELECT
+            e.id          AS int_id,
+            e.embedding_id AS uuid_id,
+            fts_content.c0 AS document,
+            e.segment_id,
+            rank
+        FROM embedding_fulltext_search fts
+        JOIN embedding_fulltext_search_content fts_content
+            ON fts_content.id = fts.rowid
+        JOIN embeddings e
+            ON e.id = fts.rowid
+        WHERE embedding_fulltext_search MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """
+
+    _METADATA_SQL = """
+        SELECT em.id, em.key, em.string_value, em.int_value, em.float_value
+        FROM embedding_metadata em
+        WHERE em.id IN ({placeholders})
+    """
+
+    _SEGMENT_COLLECTION_SQL = """
+        SELECT s.id AS segment_id, c.name AS collection_name
+        FROM segments s
+        JOIN collections c ON c.id = s.collection
+    """
+
+    def __init__(self, persist_directory: str) -> None:
+        self.persist_directory = persist_directory
+        self._db_path = os.path.join(persist_directory, "chroma.sqlite3")
+        self._segment_to_collection: Dict[str, str] = {}
+        self._collection_name_map = {
+            "alpha_claude_code": "alpha",
+            "beta_claude_desktop": "beta",
+        }
+        self._load_segment_map()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+
+    def _load_segment_map(self) -> None:
+        try:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(self._SEGMENT_COLLECTION_SQL).fetchall()
+                for seg_id, col_name in rows:
+                    simple = self._collection_name_map.get(col_name, col_name)
+                    self._segment_to_collection[seg_id] = simple
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("FTS: failed to load segment map: %s", exc)
+
+    def search(
+        self,
+        query_text: str,
+        n_results: int = 10,
+        collections: Optional[List[str]] = None,
+        project_filter: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search using FTS5 full-text search."""
+        if not query_text or not query_text.strip():
+            raise ValueError("query_text cannot be empty")
+
+        fts_query = self._build_fts_query(query_text)
+        fetch_limit = n_results * 5
+
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(self._SEARCH_SQL, (fts_query, fetch_limit)).fetchall()
+            if not rows:
+                return {"results": [], "total_matches": 0, "search_type": "fts5"}
+
+            # Build result list with collection filtering
+            int_ids = []
+            doc_map = {}
+            for int_id, uuid_id, document, segment_id, rank in rows:
+                col = self._segment_to_collection.get(segment_id, "unknown")
+                if collections and col not in collections:
+                    continue
+                int_ids.append(int_id)
+                doc_map[int_id] = {
+                    "id": uuid_id,
+                    "document": document,
+                    "collection": col,
+                    "rank": rank,
+                }
+
+            if not int_ids:
+                return {"results": [], "total_matches": 0, "search_type": "fts5"}
+
+            metadata_map = self._fetch_metadata(conn, int_ids)
+
+            results = []
+            for int_id in int_ids:
+                info = doc_map[int_id]
+                meta = metadata_map.get(int_id, {})
+
+                if project_filter and meta.get("project") != project_filter:
+                    continue
+
+                # Remove chroma:document from metadata (it's the document itself)
+                meta.pop("chroma:document", None)
+
+                results.append({
+                    "id": info["id"],
+                    "document": info["document"],
+                    "metadata": meta,
+                    "distance": abs(info["rank"]),
+                    "collection": info["collection"],
+                })
+
+                if len(results) >= n_results:
+                    break
+
+            return {
+                "results": results,
+                "total_matches": len(results),
+                "search_type": "fts5",
+            }
+        except Exception as exc:
+            logger.error("FTS search failed: %s", exc)
+            raise RuntimeError(f"FTS search failed: {exc}") from exc
+        finally:
+            conn.close()
+
+    def _build_fts_query(self, query_text: str) -> str:
+        """Convert user query to FTS5 query syntax."""
+        special = set('*"(){}[]^~:+-')
+        cleaned = "".join(c if c not in special else " " for c in query_text)
+        tokens = cleaned.split()
+        if not tokens:
+            return query_text
+        quoted = [f'"{t}"' for t in tokens if t.strip()]
+        return " OR ".join(quoted)
+
+    def _fetch_metadata(
+        self, conn: sqlite3.Connection, int_ids: List[int]
+    ) -> Dict[int, Dict[str, Any]]:
+        """Fetch metadata for a list of embedding integer IDs."""
+        if not int_ids:
+            return {}
+        placeholders = ",".join("?" for _ in int_ids)
+        sql = self._METADATA_SQL.format(placeholders=placeholders)
+        rows = conn.execute(sql, int_ids).fetchall()
+
+        meta_map: Dict[int, Dict[str, Any]] = {}
+        for emb_id, key, str_val, int_val, float_val in rows:
+            if emb_id not in meta_map:
+                meta_map[emb_id] = {}
+            value = str_val if str_val is not None else (int_val if int_val is not None else float_val)
+            meta_map[emb_id][key] = value
+        return meta_map
+
+    def is_available(self) -> bool:
+        """Check if the FTS index is usable (fast: no COUNT, just LIMIT 1)."""
+        try:
+            conn = self._get_conn()
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM embedding_fulltext_search_data LIMIT 1"
+                ).fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB Worker Client — secondary search path for vector/semantic search
+# ---------------------------------------------------------------------------
+
+class ChromaWorkerClient:
+    """Manages a ChromaDB worker subprocess for vector search.
+
+    All ChromaDB operations run in a dedicated subprocess. If it segfaults
+    due to chromadb_rust_bindings, only the worker dies — the API server
+    stays up and falls back to FTS search.
+    """
+
+    _READY_TIMEOUT = 60
+    _RPC_TIMEOUT = 30
+
+    def __init__(self, persist_directory: str, embedding_model_name: str) -> None:
+        self.persist_directory = persist_directory
+        self.embedding_model_name = embedding_model_name
+        self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._available = False
+        try:
+            self._start_worker()
+            self._available = True
+        except Exception as exc:
+            logger.warning("ChromaDB worker failed to start: %s — vector search disabled", exc)
+
+    def _start_worker(self) -> None:
+        env = os.environ.copy()
+        env["CHROMA_PERSIST_DIR"] = self.persist_directory
+        env["EMBEDDING_MODEL"] = self.embedding_model_name
+
+        logger.info("Starting ChromaDB worker subprocess...")
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "daemon.chroma_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+
+        deadline = time.monotonic() + self._READY_TIMEOUT
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                raise RuntimeError(
+                    f"ChromaDB worker exited during startup (rc={self._process.returncode})"
+                )
+            line = self._process.stdout.readline()
+            if not line:
+                raise RuntimeError("ChromaDB worker closed stdout before signalling ready")
+            try:
+                msg = json.loads(line)
+                if msg.get("result") == "ready":
+                    logger.info("ChromaDB worker ready (pid=%d)", self._process.pid)
+                    return
+            except json.JSONDecodeError:
+                pass
+
+        raise RuntimeError(f"ChromaDB worker did not become ready within {self._READY_TIMEOUT}s")
+
+    def _is_alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def _terminate(self) -> None:
+        if self._process:
+            try:
+                self._process.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+                except Exception:
+                    pass
+            self._process = None
+
+    def _rpc(self, method: str, params: dict) -> Any:
+        import select
+
+        req_id = str(uuid.uuid4())
+        self._process.stdin.write(
+            json.dumps({"id": req_id, "method": method, "params": params}) + "\n"
+        )
+        self._process.stdin.flush()
+
+        ready, _, _ = select.select([self._process.stdout], [], [], self._RPC_TIMEOUT)
+        if not ready:
+            raise RuntimeError(f"Worker RPC timeout after {self._RPC_TIMEOUT}s")
+
+        line = self._process.stdout.readline()
+        if not line:
+            raise RuntimeError("Worker process died (stdout EOF)")
+
+        resp = json.loads(line)
+        if "error" in resp:
+            raise RuntimeError(f"Worker error: {resp['error']}")
+        return resp["result"]
+
+    @property
+    def is_available(self) -> bool:
+        return self._available and self._is_alive()
+
+    def call(self, method: str, params: dict) -> Any:
+        if not self._available:
+            return None
+        with self._lock:
+            if not self._is_alive():
+                logger.warning("ChromaDB worker died — restarting...")
+                try:
+                    self._start_worker()
+                except Exception as exc:
+                    logger.error("Worker restart failed: %s — disabling vector search", exc)
+                    self._available = False
+                    return None
+            try:
+                return self._rpc(method, params)
+            except RuntimeError as exc:
+                logger.error("Worker call failed (%s) — restarting once", exc)
+                self._terminate()
+                try:
+                    self._start_worker()
+                    return self._rpc(method, params)
+                except Exception as exc2:
+                    logger.error("Worker retry failed: %s — disabling vector search", exc2)
+                    self._available = False
+                    return None
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._terminate()
+            self._available = False
+
+
+# ---------------------------------------------------------------------------
+# Main Database Class
+# ---------------------------------------------------------------------------
+
+class DualSourceKnowledgeDB:
+    """Dual-collection knowledge base with hybrid FTS + vector search.
+
+    Primary search: SQLite FTS5 (fast, reliable, works on all collections).
+    Secondary search: ChromaDB vector search (beta collection only — alpha
+    segfaults due to 2M+ record HNSW index).
     """
 
     def __init__(
         self,
         persist_directory: str = "/app/knowledge",
-        embedding_model_name: str = "all-MiniLM-L6-v2"
+        embedding_model_name: str = "all-MiniLM-L6-v2",
     ) -> None:
-        """
-        Initialize the knowledge database with two collections:
-        - alpha_claude_code (JSON)
-        - beta_claude_desktop (LevelDB)
-
-        Args:
-            persist_directory: Path where ChromaDB will store its data.
-            embedding_model_name: Name or path to a sentence-transformers model.
-                                 Default is 'all-MiniLM-L6-v2' for speed/size balance.
-        
-        Raises:
-            RuntimeError: If embedding model cannot be loaded or ChromaDB initialization fails.
-        """
         self.persist_directory = persist_directory
         self.embedding_model_name = embedding_model_name
-        
-        try:
-            # Initialize embedding model
-            logger.info(f"Loading embedding model: {embedding_model_name}")
-            self.embedder = SentenceTransformer(embedding_model_name)
-            
-            # Ensure persist directory exists
-            os.makedirs(persist_directory, exist_ok=True)
-            
-            # Configure Chroma client
-            logger.info(f"Initializing ChromaDB at {persist_directory}")
-            self.client = chromadb.PersistentClient(
-                path=persist_directory,
-                settings=Settings(anonymized_telemetry=False)
-            )
+        os.makedirs(persist_directory, exist_ok=True)
 
-            # Create or get collections
-            self.alpha_collection = self.client.get_or_create_collection(
-                name="alpha_claude_code",
-                embedding_function=self._get_embedding_function()
-            )
-            self.beta_collection = self.client.get_or_create_collection(
-                name="beta_claude_desktop",
-                embedding_function=self._get_embedding_function()
-            )
-            
-            logger.info("DualSourceKnowledgeDB initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize DualSourceKnowledgeDB: {e}")
-            raise RuntimeError(f"Database initialization failed: {e}") from e
+        # Primary: FTS5 search (always available if SQLite DB exists)
+        self._fts = FTSSearchEngine(persist_directory)
+        fts_ok = self._fts.is_available()
+        logger.info("FTS5 search engine: %s", "available" if fts_ok else "unavailable")
 
-    def _get_embedding_function(self) -> embedding_functions.SentenceTransformerEmbeddingFunction:
-        """
-        Return the embedding function compatible with ChromaDB.
-        
-        Returns:
-            SentenceTransformerEmbeddingFunction configured with the model.
-        """
-        return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=self.embedding_model_name
+        # Secondary: ChromaDB worker for vector search (may fail gracefully)
+        self._worker = ChromaWorkerClient(persist_directory, embedding_model_name)
+        logger.info(
+            "ChromaDB vector search: %s",
+            "available" if self._worker.is_available else "disabled",
         )
 
-    def index_conversation(
-        self, 
-        conversation: Dict[str, Any], 
-        collection: str = "auto"
-    ) -> None:
-        """
-        Index each message in a conversation into the appropriate collection.
-        
-        The conversation dictionary should have the following structure:
-        {
-            "id": "conversation_id",
-            "messages": [
-                {
-                    "role": "user" or "assistant",
-                    "content": "message text",
-                    "timestamp": "ISO 8601 timestamp"
-                },
-                ...
-            ],
-            "metadata": {
-                "source": "json" or "leveldb",
-                "project": "project_name"
-            }
-        }
+        if not fts_ok and not self._worker.is_available:
+            raise RuntimeError("No search backend available (FTS5 and ChromaDB both failed)")
 
-        Args:
-            conversation: Dictionary containing messages and metadata.
-            collection: Target collection ("alpha", "beta", or "auto").
-                       If "auto", detects from metadata.source field.
-                       "json" source -> alpha collection
-                       "leveldb" source -> beta collection
-        
-        Raises:
-            ValueError: If auto detection fails or invalid collection specified.
-            RuntimeError: If indexing operation fails.
-        """
-        try:
-            # Handle both dataclass and dict conversation objects
-            from dataclasses import is_dataclass, asdict
-
-            if is_dataclass(conversation):
-                # Convert dataclass to dict for easier access
-                conv_dict = asdict(conversation)
-            else:
-                conv_dict = conversation
-
-            # Auto-detect collection from metadata.source
-            if collection == "auto":
-                source = conv_dict.get("metadata", {}).get("source")
-                if not source:
-                    raise ValueError(
-                        "Missing 'source' field in metadata required for auto-detection. "
-                        "Expected metadata.source to be 'json' or 'leveldb'."
-                    )
-
-                collection_map = {
-                    "json": "alpha",
-                    "leveldb": "beta"
-                }
-                detected_collection = collection_map.get(source.lower())
-
-                if not detected_collection:
-                    raise ValueError(
-                        f"Unknown source '{source}' for auto-detection. "
-                        f"Expected 'json' or 'leveldb'."
-                    )
-
-                collection = detected_collection
-                logger.debug(f"Auto-detected collection: {collection} from source: {source}")
-
-            # Validate collection name
-            if collection not in ["alpha", "beta"]:
-                raise ValueError(
-                    f"Invalid collection '{collection}'. Must be 'alpha', 'beta', or 'auto'."
-                )
-
-            # Select target collection
-            target_collection = (
-                self.alpha_collection if collection == "alpha"
-                else self.beta_collection
-            )
-
-            # Extract messages and prepare for indexing
-            messages = conv_dict.get("messages", [])
-            if not messages:
-                logger.warning("No messages found in conversation, skipping indexing")
-                return
-
-            metadatas: List[Dict[str, Any]] = []
-            documents: List[str] = []
-            ids: List[str] = []
-
-            conversation_id = conv_dict.get("id", str(uuid.uuid4()))
-            # Build metadata from conversation attributes
-            conversation_metadata = {
-                "project": conv_dict.get("project", ""),
-                "source": "jsonl",  # Mark as coming from JSONL files
-                "cwd": conv_dict.get("cwd", ""),
-                "git_branch": conv_dict.get("git_branch", "")
-            }
-
-            for msg in messages:
-                # Handle both dataclass Message and dict
-                if is_dataclass(msg):
-                    msg_dict = asdict(msg)
-                else:
-                    msg_dict = msg
-
-                content = msg_dict.get("content", "")
-                if not content or not content.strip():
-                    logger.debug("Skipping empty message")
-                    continue  # Skip empty messages
-
-                # Handle timestamp - convert datetime to ISO string if needed
-                timestamp = msg_dict.get("timestamp", datetime.utcnow())
-                if isinstance(timestamp, datetime):
-                    timestamp_str = timestamp.isoformat()
-                else:
-                    timestamp_str = str(timestamp)
-
-                # Build metadata for each message
-                metadata = {
-                    "conversation_id": conversation_id,
-                    "role": msg_dict.get("role", "unknown"),
-                    "timestamp": timestamp_str,
-                    "project": conversation_metadata.get("project", ""),
-                    "source": conversation_metadata.get("source", ""),
-                    "cwd": conversation_metadata.get("cwd", ""),
-                    "git_branch": conversation_metadata.get("git_branch", "")
-                }
-
-                documents.append(content)
-                metadatas.append(metadata)
-                ids.append(str(uuid.uuid4()))
-
-            # Index all messages in batch
-            if documents:
-                target_collection.add(
-                    documents=documents, 
-                    metadatas=metadatas, 
-                    ids=ids
-                )
-                logger.info(
-                    f"Indexed {len(documents)} messages from conversation {conversation_id} "
-                    f"into {collection} collection"
-                )
-            else:
-                logger.warning(
-                    f"No valid messages to index in conversation {conversation_id}"
-                )
-
-        except ValueError as e:
-            logger.error(f"Validation error during conversation indexing: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to index conversation: {e}")
-            raise RuntimeError(f"Indexing operation failed: {e}") from e
+        logger.info("DualSourceKnowledgeDB initialized successfully")
 
     def query_unified(
         self,
         query_text: str,
         n_results: int = 10,
-        collections: List[str] = ["alpha", "beta"],
-        project_filter: Optional[str] = None
+        collections: Optional[List[str]] = None,
+        project_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Query both collections and merge results sorted by distance (similarity).
-        
-        This method performs semantic search across the specified collections,
-        merges results, and returns them sorted by distance (lower = more similar).
+        """Search across collections using FTS5 (primary) + optional vector search."""
+        if collections is None:
+            collections = ["alpha", "beta"]
 
-        Args:
-            query_text: Text to search for semantically similar entries.
-            n_results: Number of top results to return after merging and sorting.
-            collections: Which collections to include in the query.
-                        Options: ["alpha", "beta"] or any subset.
-            project_filter: Optional filter for project field in metadata.
-                           Only returns results matching this project.
+        if not query_text or not query_text.strip():
+            raise ValueError("query_text cannot be empty")
 
-        Returns:
-            Dictionary with structure:
-            {
-                "results": [
-                    {
-                        "id": "uuid",
-                        "document": "message content",
-                        "metadata": {
-                            "conversation_id": "...",
-                            "role": "...",
-                            "timestamp": "...",
-                            "project": "...",
-                            "source": "..."
-                        },
-                        "distance": 0.123,
-                        "collection": "alpha" or "beta"
-                    },
-                    ...
-                ],
-                "total_matches": 42
-            }
-        
-        Raises:
-            ValueError: If query_text is empty.
-            RuntimeError: If query operation fails.
-        """
+        # Primary: FTS5 search
+        fts_results = None
         try:
-            if not query_text or not query_text.strip():
-                raise ValueError("query_text cannot be empty")
-            
-            results: List[Dict[str, Any]] = []
-            
-            # Build metadata filter
-            filters: Dict[str, Any] = {}
-            if project_filter:
-                filters["project"] = project_filter
-                logger.debug(f"Applying project filter: {project_filter}")
-
-            # Map collection names to objects
-            valid_collections = {
-                "alpha": self.alpha_collection, 
-                "beta": self.beta_collection
-            }
-
-            # Query each requested collection
-            for col_name in collections:
-                if col_name not in valid_collections:
-                    logger.warning(
-                        f"Ignoring unknown collection '{col_name}'. "
-                        f"Valid options: {list(valid_collections.keys())}"
-                    )
-                    continue
-
-                collection = valid_collections[col_name]
-                
-                logger.debug(f"Querying collection: {col_name}")
-                res = collection.query(
-                    query_texts=[query_text],
-                    n_results=n_results,
-                    where=filters if filters else None
-                )
-
-                # Unpack results and add collection name
-                for i in range(len(res['ids'][0])):
-                    results.append({
-                        "id": res['ids'][0][i],
-                        "document": res['documents'][0][i],
-                        "metadata": res['metadatas'][0][i],
-                        "distance": res['distances'][0][i],
-                        "collection": col_name
-                    })
-
-            # Sort all results by distance ascending (lower distance = more similar)
-            results.sort(key=lambda x: x["distance"])
-            
-            total_matches = len(results)
-            top_results = results[:n_results]
-            
-            logger.info(
-                f"Query returned {total_matches} total matches, "
-                f"returning top {len(top_results)}"
+            fts_results = self._fts.search(
+                query_text=query_text,
+                n_results=n_results,
+                collections=collections,
+                project_filter=project_filter,
             )
+        except Exception as exc:
+            logger.warning("FTS5 search failed: %s — trying vector search", exc)
 
-            return {
-                "results": top_results,
-                "total_matches": total_matches
-            }
-            
-        except ValueError as e:
-            logger.error(f"Validation error during query: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to execute unified query: {e}")
-            raise RuntimeError(f"Query operation failed: {e}") from e
+        # Secondary: Vector search on beta only (alpha segfaults)
+        vector_results = None
+        if self._worker.is_available and "beta" in collections:
+            try:
+                vector_results = self._worker.call("query", {
+                    "query_text": query_text,
+                    "n_results": n_results,
+                    "collections": ["beta"],
+                    "project_filter": project_filter,
+                })
+            except Exception as exc:
+                logger.warning("Vector search failed: %s", exc)
+
+        # Merge results
+        if fts_results and vector_results:
+            return self._merge_results(fts_results, vector_results, n_results)
+        elif fts_results:
+            return fts_results
+        elif vector_results:
+            return vector_results
+        else:
+            raise RuntimeError("All search backends failed")
+
+    def _merge_results(
+        self, fts: Dict, vector: Dict, n_results: int
+    ) -> Dict[str, Any]:
+        """Merge FTS5 and vector search results, deduplicating by ID."""
+        seen_ids = set()
+        merged = []
+
+        # FTS results first (more relevant for text search)
+        for r in fts.get("results", []):
+            seen_ids.add(r["id"])
+            merged.append(r)
+
+        # Add unique vector results
+        for r in vector.get("results", []):
+            if r["id"] not in seen_ids:
+                seen_ids.add(r["id"])
+                merged.append(r)
+
+        return {
+            "results": merged[:n_results],
+            "total_matches": len(merged),
+            "search_type": "hybrid",
+        }
+
+    def index_conversation(
+        self,
+        conversation: Dict[str, Any],
+        collection: str = "auto",
+    ) -> None:
+        from dataclasses import asdict, is_dataclass
+
+        if not self._worker.is_available:
+            raise RuntimeError("ChromaDB worker is not available for indexing")
+
+        conv_dict = asdict(conversation) if is_dataclass(conversation) else conversation
+        result = self._worker.call("index", {
+            "conversation": conv_dict,
+            "collection": collection,
+        })
+        if result is None:
+            raise RuntimeError("Indexing failed: worker unavailable")
 
     def get_collection_stats(self) -> Dict[str, Any]:
-        """
-        Get detailed statistics about both collections.
-        
-        Provides information about:
-        - Total message count per collection
-        - Unique sources per collection
-        - Unique projects per collection
+        """Get document counts per collection via SQLite (safe, no ChromaDB client calls).
+
+        Works with both ChromaDB 1.3.x and 1.5.x schemas. The 1.5.x migration
+        added a METADATA/VECTOR segment split; we filter to METADATA segments only
+        to avoid double-counting.
 
         Returns:
-            Dictionary mapping collection names to their stats:
-            {
-                "alpha": {
-                    "count": 42,
-                    "sources": ["json"],
-                    "projects": ["project1", "project2"]
-                },
-                "beta": {
-                    "count": 128,
-                    "sources": ["leveldb"],
-                    "projects": ["project3"]
-                },
-                "total": {
-                    "count": 170,
-                    "sources": ["json", "leveldb"],
-                    "projects": ["project1", "project2", "project3"]
-                }
-            }
-        
-        Raises:
-            RuntimeError: If stats collection fails.
+            {"alpha": {"count": N}, "beta": {"count": N}, "total": {"count": N}}
         """
         try:
-            stats: Dict[str, Any] = {}
-            all_sources = set()
-            all_projects = set()
-            total_count = 0
+            import sqlite3
 
-            # Collect stats for each collection
-            for name, collection in [
-                ("alpha", self.alpha_collection), 
-                ("beta", self.beta_collection)
-            ]:
-                logger.debug(f"Collecting stats for {name} collection")
-                
-                count = collection.count()
-                total_count += count
-                
-                if count > 0:
-                    # Get all metadata to extract unique values
-                    all_metadata = collection.get(include=["metadatas"])["metadatas"]
-                    
-                    sources = list(set(
-                        md.get("source") 
-                        for md in all_metadata 
-                        if md.get("source")
-                    ))
-                    
-                    projects = list(set(
-                        md.get("project") 
-                        for md in all_metadata 
-                        if md.get("project")
-                    ))
-                    
-                    all_sources.update(sources)
-                    all_projects.update(projects)
-                else:
-                    sources = []
-                    projects = []
-
-                stats[name] = {
-                    "count": count,
-                    "sources": sorted(sources),
-                    "projects": sorted(projects)
-                }
-
-            # Add total stats
-            stats["total"] = {
-                "count": total_count,
-                "sources": sorted(list(all_sources)),
-                "projects": sorted(list(all_projects))
+            collection_name_map = {
+                "alpha_claude_code": "alpha",
+                "beta_claude_desktop": "beta",
             }
-            
-            logger.info(f"Retrieved stats for all collections: {total_count} total messages")
+            stats: Dict[str, Any] = {
+                "alpha": {"count": 0, "sources": [], "projects": []},
+                "beta": {"count": 0, "sources": [], "projects": []},
+            }
+
+            sqlite_path = os.path.join(self.persist_directory, "chroma.sqlite3")
+            conn = sqlite3.connect(sqlite_path)
+            cursor = conn.cursor()
+
+            # ChromaDB 1.5+ splits segments into METADATA and VECTOR scopes.
+            # Embeddings are stored under METADATA segments; filter to avoid
+            # double-counting when both segment types join to the same embeddings.
+            cursor.execute(
+                """
+                SELECT c.name, COUNT(e.id)
+                FROM collections c
+                JOIN segments s ON s.collection = c.id
+                JOIN embeddings e ON e.segment_id = s.id
+                WHERE s.scope = 'METADATA'
+                GROUP BY c.name
+                """
+            )
+
+            total_count = 0
+            for chroma_name, count in cursor.fetchall():
+                simple_name = collection_name_map.get(chroma_name)
+                if simple_name:
+                    stats[simple_name]["count"] = count
+                    total_count += count
+
+            conn.close()
+
+            stats["total"] = {"count": total_count, "sources": [], "projects": []}
+            logger.info(
+                f"Retrieved stats for all collections: {total_count} total messages"
+            )
             return stats
-            
+
         except Exception as e:
             logger.error(f"Failed to get collection stats: {e}")
             raise RuntimeError(f"Stats collection failed: {e}") from e
 
     def get_stats(self) -> Dict[str, Any]:
-        """
-        Backward-compatible alias for get_collection_stats().
-
-        Returns the same structure as get_collection_stats() for compatibility
-        with existing code that expects the old KnowledgeDB API.
-
-        Returns:
-            Dictionary with collection statistics.
-        """
         return self.get_collection_stats()
 
+    def test_search(self) -> Dict[str, Any]:
+        """Run a quick search to validate the worker and HNSW index are functional."""
+        try:
+            result = self._worker.call("query", {
+                "query_text": "test",
+                "n_results": 1,
+                "collections": ["alpha", "beta"],
+                "project_filter": None,
+            })
+            return {
+                "status": "PASS",
+                "total_matches": result.get("total_matches", 0),
+            }
+        except Exception as exc:
+            return {"status": "FAIL", "error": str(exc)[:200]}
 
-# Example usage and testing
-if __name__ == "__main__":
-    # Configure logging for standalone execution
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-    )
-    
-    # Initialize database
-    db = DualSourceKnowledgeDB(persist_directory="./knowledge_db_test")
-    
-    # Example: Index JSON-based conversation
-    conversation_json = {
-        "id": "conv_001",
-        "messages": [
-            {
-                "role": "user", 
-                "content": "How do I deploy this application?", 
-                "timestamp": "2025-04-05T10:00:00Z"
-            },
-            {
-                "role": "assistant", 
-                "content": "You can deploy using Docker containers. First, build the image, then run it.", 
-                "timestamp": "2025-04-05T10:01:00Z"
-            }
-        ],
-        "metadata": {
-            "source": "json",
-            "project": "deploy-tools"
-        }
-    }
-    
-    # Example: Index LevelDB-based conversation
-    conversation_leveldb = {
-        "id": "conv_002",
-        "messages": [
-            {
-                "role": "user", 
-                "content": "What's my desktop configuration?", 
-                "timestamp": "2025-04-05T10:05:00Z"
-            },
-            {
-                "role": "assistant", 
-                "content": "Your desktop config is stored locally at ~/.config/desktop.", 
-                "timestamp": "2025-04-05T10:06:00Z"
-            }
-        ],
-        "metadata": {
-            "source": "leveldb",
-            "project": "desktop-agent"
-        }
-    }
-    
-    # Index conversations
-    print("\n=== Indexing Conversations ===")
-    db.index_conversation(conversation_json, collection="auto")
-    db.index_conversation(conversation_leveldb, collection="auto")
-    
-    # Get stats
-    print("\n=== Collection Statistics ===")
-    stats = db.get_collection_stats()
-    print(json.dumps(stats, indent=2))
-    
-    # Perform unified query
-    print("\n=== Unified Query ===")
-    results = db.query_unified(
-        query_text="how can I deploy applications?",
-        n_results=5,
-        collections=["alpha", "beta"]
-    )
-    print(json.dumps(results, indent=2))
-    
-    # Query with project filter
-    print("\n=== Query with Project Filter ===")
-    results_filtered = db.query_unified(
-        query_text="configuration settings",
-        n_results=3,
-        collections=["beta"],
-        project_filter="desktop-agent"
-    )
-    print(json.dumps(results_filtered, indent=2))
+    def shutdown(self) -> None:
+        if self._worker:
+            self._worker.shutdown()
