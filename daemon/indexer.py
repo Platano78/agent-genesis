@@ -2,30 +2,34 @@
 Conversation indexing orchestrator.
 
 Coordinates:
-1. Parsing conversations (JSON + LevelDB)
+1. Parsing conversations (JSON + Anthropic export)
 2. Generating embeddings (bge-small)
 3. Indexing to ChromaDB (dual collections)
 4. MKG analysis (optional enrichment)
 """
 
+import glob
+import hashlib
+import json
 import logging
+from collections import defaultdict
 from typing import List, Optional
 from pathlib import Path
 from datetime import datetime
 
 try:
     # Try relative imports first (when run from parent directory)
-    from daemon.parser import parse_claude_json, Conversation
+    from daemon.parser import parse_claude_json, Conversation, Message
     from daemon.jsonl_parser import scan_projects_directory
-    from daemon.leveldb_parser import LevelDBParser
+    from daemon.claude_web_parser import ClaudeWebParser
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.embeddings import get_embedding_generator
     from daemon.mkg_client import MKGClient
 except ImportError:
     # Fall back to direct imports (when run from daemon directory)
-    from parser import parse_claude_json, Conversation
+    from parser import parse_claude_json, Conversation, Message
     from jsonl_parser import scan_projects_directory
-    from leveldb_parser import LevelDBParser
+    from claude_web_parser import ClaudeWebParser
     from knowledge_db_dual import DualSourceKnowledgeDB
     from embeddings import get_embedding_generator
     from mkg_client import MKGClient
@@ -88,39 +92,134 @@ class ConversationIndexer:
             logger.error(f"Claude Code indexing failed: {e}")
             return 0
 
-    def index_claude_desktop_leveldb(self, leveldb_path: str) -> int:
+    def index_anthropic_export(self, exports_dir: str = "/app/data/exports") -> int:
         """
-        Index Claude Desktop LevelDB conversations.
+        Index Claude.ai web conversations from Anthropic data export ZIP.
+
+        Auto-detects newest data-*.zip in exports_dir. Uses MD5 hash to skip
+        re-parsing unchanged exports. Self-heals after ChromaDB purges by
+        detecting empty Beta collection.
 
         Args:
-            leveldb_path: Path to Claude Desktop leveldb directory
+            exports_dir: Directory containing data-*.zip export files
 
         Returns:
             Number of conversations indexed
         """
-        logger.info(f"Indexing Claude Desktop conversations from {leveldb_path}")
+        state_path = Path(self.db.persist_directory) / "beta_import_state.json"
 
-        try:
-            with LevelDBParser(leveldb_path) as parser:
-                conversations = parser.parse_all_conversations()
-
-            logger.info(f"Parsed {len(conversations)} Desktop conversations")
-
-            # Index to Collection Beta
-            indexed = 0
-            for convo in conversations:
-                try:
-                    self._index_conversation(convo, collection="beta")
-                    indexed += 1
-                except Exception as e:
-                    logger.warning(f"Failed to index conversation {convo.id}: {e}")
-
-            logger.info(f"✅ Indexed {indexed} Desktop conversations to Beta")
-            return indexed
-
-        except Exception as e:
-            logger.error(f"Desktop indexing failed: {e}")
+        # Auto-detect newest export ZIP
+        zip_pattern = str(Path(exports_dir) / "data-*.zip")
+        zip_files = sorted(glob.glob(zip_pattern))
+        if not zip_files:
+            logger.warning(f"No data-*.zip files found in {exports_dir}")
             return 0
+
+        zip_path = zip_files[-1]  # newest by filename timestamp sort
+        logger.info(f"Found export: {zip_path}")
+
+        # Compute MD5 hash of the ZIP
+        current_md5 = self._md5_file(zip_path)
+
+        # Check if Beta collection is empty (self-healing after purge)
+        beta_empty = self._is_beta_empty()
+
+        # Hash-based skip: if same file already indexed and Beta not empty, skip
+        if state_path.exists() and not beta_empty:
+            try:
+                with open(state_path, 'r') as f:
+                    state = json.load(f)
+                if state.get("md5") == current_md5:
+                    logger.info(
+                        f"⏭️  Export unchanged (MD5 match), Beta has data. "
+                        f"Skipping. Last indexed: {state.get('indexed_at', 'unknown')}"
+                    )
+                    return 0
+            except (json.JSONDecodeError, KeyError):
+                pass  # Corrupt state file, proceed with reimport
+
+        if beta_empty:
+            logger.info("🔄 Beta collection empty — forcing reimport (self-healing)")
+
+        # Parse the export ZIP
+        logger.info(f"Parsing Anthropic export: {zip_path}")
+        parser = ClaudeWebParser()
+        messages = parser.parse_zip(zip_path)
+        metrics = parser.get_metrics()
+
+        logger.info(
+            f"Parsed {metrics.total_messages} messages from "
+            f"{metrics.total_conversations} conversations "
+            f"({metrics.failed_conversations} failed, {metrics.schema_errors} schema errors)"
+        )
+
+        # Group messages by conversation_id (pattern from import_to_container.py)
+        conversations_dict = defaultdict(list)
+        for msg in messages:
+            conversations_dict[msg.conversation_id].append(msg)
+
+        # Convert to Conversation objects and index to Beta
+        indexed = 0
+        total_messages = 0
+        for conv_id, conv_messages in conversations_dict.items():
+            try:
+                # Build Conversation dataclass matching what _index_conversation expects
+                msgs = [
+                    Message(
+                        role=m.role,
+                        content=m.content,
+                        timestamp=m.timestamp
+                    )
+                    for m in sorted(conv_messages, key=lambda x: x.timestamp)
+                ]
+                conversation = Conversation(
+                    id=conv_id,
+                    timestamp=msgs[0].timestamp if msgs else datetime.now(),
+                    messages=msgs,
+                    project="claude-web-import"
+                )
+                self._index_conversation(conversation, collection="beta")
+                indexed += 1
+                total_messages += len(msgs)
+                if indexed % 100 == 0:
+                    logger.info(f"  Progress: {indexed}/{len(conversations_dict)} conversations")
+            except Exception as e:
+                logger.warning(f"Failed to index conversation {conv_id}: {e}")
+
+        logger.info(f"✅ Indexed {indexed} web conversations ({total_messages} messages) to Beta")
+
+        # Write state file for hash-based skip on next run
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(state_path, 'w') as f:
+                json.dump({
+                    "last_file": Path(zip_path).name,
+                    "md5": current_md5,
+                    "indexed_at": datetime.now().isoformat(),
+                    "conversations": indexed,
+                    "messages": total_messages
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write beta import state: {e}")
+
+        return indexed
+
+    def _md5_file(self, filepath: str) -> str:
+        """Compute MD5 hash of a file."""
+        md5 = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                md5.update(chunk)
+        return md5.hexdigest()
+
+    def _is_beta_empty(self) -> bool:
+        """Check if Beta collection has zero documents."""
+        try:
+            stats = self.db.get_collection_stats()
+            beta_stats = stats.get('beta', {})
+            return beta_stats.get('count', 0) == 0
+        except Exception:
+            return True  # If we can't check, assume empty and reimport
 
     def index_claude_projects_jsonl(self, projects_dir: str, project_filter: Optional[str] = None) -> int:
         """
@@ -159,7 +258,7 @@ class ConversationIndexer:
     def index_all_sources(
         self,
         projects_dir: str = "/app/data/claude-projects",
-        leveldb_path: str = "/app/data/claude-desktop-leveldb",
+        exports_dir: str = "/app/data/exports",
         project_filter: Optional[str] = None
     ) -> dict:
         """
@@ -167,7 +266,7 @@ class ConversationIndexer:
 
         Args:
             projects_dir: Path to Claude Code projects directory (JSONL files)
-            leveldb_path: Path to Claude Desktop LevelDB directory
+            exports_dir: Path to Anthropic data export directory (ZIP files)
             project_filter: Optional project name filter for JSONL indexing
 
         Returns:
@@ -181,7 +280,7 @@ class ConversationIndexer:
             "errors": []
         }
 
-        # Index Claude Code JSONL (Alpha) - NEW PRIMARY SOURCE
+        # Index Claude Code JSONL (Alpha) - PRIMARY SOURCE
         if Path(projects_dir).exists():
             try:
                 stats["alpha_indexed"] = self.index_claude_projects_jsonl(projects_dir, project_filter)
@@ -190,12 +289,14 @@ class ConversationIndexer:
         else:
             logger.warning(f"Projects directory not found: {projects_dir}")
 
-        # Index Claude Desktop (Beta)
-        if Path(leveldb_path).exists():
+        # Index Anthropic web export (Beta)
+        if Path(exports_dir).exists():
             try:
-                stats["beta_indexed"] = self.index_claude_desktop_leveldb(leveldb_path)
+                stats["beta_indexed"] = self.index_anthropic_export(exports_dir)
             except Exception as e:
-                stats["errors"].append(f"Beta indexing: {e}")
+                stats["errors"].append(f"Beta export indexing: {e}")
+        else:
+            logger.warning(f"Exports directory not found: {exports_dir}")
 
         stats["total_indexed"] = stats["alpha_indexed"] + stats["beta_indexed"]
         stats["end_time"] = datetime.now()
@@ -246,7 +347,7 @@ def run_initial_indexing():
     # Print results
     print("\nIndexing Results:")
     print(f"  Alpha (Claude Code):    {stats['alpha_indexed']} conversations")
-    print(f"  Beta (Desktop):         {stats['beta_indexed']} conversations")
+    print(f"  Beta (Web Export):      {stats['beta_indexed']} conversations")
     print(f"  Total:                  {stats['total_indexed']} conversations")
     print(f"  Duration:               {stats['duration']:.1f}s")
 
@@ -259,8 +360,8 @@ def run_initial_indexing():
     try:
         collection_stats = indexer.db.get_collection_stats()
         print("\nCollection Statistics:")
-        alpha_count = collection_stats.get('alpha_claude_code', {}).get('count', 0)
-        beta_count = collection_stats.get('beta_claude_desktop', {}).get('count', 0)
+        alpha_count = collection_stats.get('alpha', {}).get('count', 0)
+        beta_count = collection_stats.get('beta', {}).get('count', 0)
         print(f"  Alpha: {alpha_count} documents")
         print(f"  Beta:  {beta_count} documents")
     except Exception as e:

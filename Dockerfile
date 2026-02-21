@@ -6,7 +6,6 @@ FROM python:3.11-slim
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
-    libleveldb-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -16,9 +15,6 @@ WORKDIR /app
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --timeout 300 -r requirements.txt
-
-# Install plyvel-ci for Python 3.11+ compatibility
-RUN pip install --no-cache-dir --timeout 300 plyvel-ci
 
 # Copy application code
 COPY daemon/ ./daemon/

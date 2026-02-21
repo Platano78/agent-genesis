@@ -144,14 +144,14 @@ def run_manual_indexing(
         # Determine data paths
         data_dir = Path(__file__).parent.parent / "data"
         projects_dir = data_dir / "claude-projects"
-        leveldb_path = data_dir / "claude-desktop-leveldb"
+        exports_dir = data_dir / "exports"
 
         # Note: full_reindex and cutoff_time filtering would need to be
         # implemented in the indexer's index_all_sources method.
         # For now, we run the standard indexing (which only indexes new conversations)
         stats = indexer.index_all_sources(
             projects_dir=str(projects_dir),
-            leveldb_path=str(leveldb_path)
+            exports_dir=str(exports_dir)
         )
 
         # Update rate limit tracker

@@ -22,6 +22,7 @@ After successful init, worker writes:
     {"id": "__init__", "result": "ready"}
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -195,7 +196,7 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
     }
 
     documents, metadatas, ids = [], [], []
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         content = msg.get("content", "")
         if not content.strip():
             continue
@@ -211,10 +212,15 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
             "cwd": conv_meta["cwd"],
             "git_branch": conv_meta["git_branch"],
         })
-        ids.append(str(uuid.uuid4()))
+        # Deterministic ID: same conversation + message index = same ID
+        # Prevents duplicates on reindex
+        doc_id = hashlib.sha256(
+            f"{conversation_id}:{msg_idx}:{content[:200]}".encode()
+        ).hexdigest()[:36]
+        ids.append(doc_id)
 
     if documents:
-        target.add(documents=documents, metadatas=metadatas, ids=ids)
+        target.upsert(documents=documents, metadatas=metadatas, ids=ids)
         logger.info(
             "Indexed %d messages from %s into %s", len(documents), conversation_id, collection
         )

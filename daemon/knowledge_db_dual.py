@@ -443,20 +443,33 @@ class DualSourceKnowledgeDB:
     def _merge_results(
         self, fts: Dict, vector: Dict, n_results: int
     ) -> Dict[str, Any]:
-        """Merge FTS5 and vector search results, deduplicating by ID."""
+        """Merge FTS5 and vector search results, deduplicating by conversation."""
         seen_ids = set()
-        merged = []
+        all_results = []
 
         # FTS results first (more relevant for text search)
         for r in fts.get("results", []):
             seen_ids.add(r["id"])
-            merged.append(r)
+            all_results.append(r)
 
-        # Add unique vector results
+        # Add unique vector results (by document ID)
         for r in vector.get("results", []):
             if r["id"] not in seen_ids:
                 seen_ids.add(r["id"])
-                merged.append(r)
+                all_results.append(r)
+
+        # Deduplicate by conversation_id: keep best-scoring message per conversation
+        seen_convs = {}
+        for r in all_results:
+            meta = r.get("metadata", r.get("metadatas", {}))
+            if isinstance(meta, list):
+                meta = meta[0] if meta else {}
+            conv_id = meta.get("conversation_id", r.get("id"))
+            score = r.get("score", r.get("distance", 0))
+            if conv_id not in seen_convs or score > seen_convs[conv_id].get("score", seen_convs[conv_id].get("distance", 0)):
+                seen_convs[conv_id] = r
+
+        merged = list(seen_convs.values())
 
         return {
             "results": merged[:n_results],
@@ -470,11 +483,26 @@ class DualSourceKnowledgeDB:
         collection: str = "auto",
     ) -> None:
         from dataclasses import asdict, is_dataclass
+        from datetime import datetime
+        import json
 
         if not self._worker.is_available:
             raise RuntimeError("ChromaDB worker is not available for indexing")
 
         conv_dict = asdict(conversation) if is_dataclass(conversation) else conversation
+
+        # Convert datetime objects to ISO strings for JSON serialization
+        def _sanitize(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            if isinstance(obj, dict):
+                return {k: _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_sanitize(v) for v in obj]
+            return obj
+
+        conv_dict = _sanitize(conv_dict)
+
         result = self._worker.call("index", {
             "conversation": conv_dict,
             "collection": collection,
