@@ -64,7 +64,7 @@ docker --version
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/agentgenesis/agent-genesis.git
+git clone https://github.com/Platano78/agent-genesis.git
 cd agent-genesis
 ```
 
@@ -187,15 +187,14 @@ docker-compose up -d
 
 ### Step 2: Import the ZIP
 
+The indexer automatically detects `data-*.zip` files in the exports volume. Copy your ZIP into the container's exports directory, then trigger indexing:
+
 ```bash
-# Create the data folder if it doesn't exist
-mkdir -p ./data
+# Copy the ZIP into the container's exports volume
+docker cp /path/to/your/data-export.zip agent-genesis:/app/data/exports/
 
-# Copy your ZIP file
-cp /path/to/your/data-export.zip ./data/
-
-# Run the import
-docker exec -it agent-genesis python /app/import_to_container.py /app/data/data-export.zip
+# Trigger indexing (picks up the new export automatically)
+curl -X POST http://localhost:8080/index/trigger
 ```
 
 ### Step 3: Verify
@@ -404,8 +403,11 @@ The service needs ~4-6GB RAM for the embedding model. Increase Docker memory:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/stats` | GET | Conversation counts |
+| `/health` | GET | Health check (collection stats + disk usage) |
+| `/health/deep` | GET | Deep health check with ChromaDB search validation |
+| `/live` | GET | Liveness probe (no DB calls, always fast) |
+| `/ready` | GET | Readiness probe (collection stats + disk usage) |
+| `/stats` | GET | Conversation counts per collection |
 | `/search` | POST | Search conversations |
 | `/index/trigger` | POST | Trigger indexing |
 
