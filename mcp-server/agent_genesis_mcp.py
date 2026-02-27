@@ -5,6 +5,7 @@ via the Agent Genesis Phase 2 API.
 """
 
 import logging
+import os
 from typing import Optional
 import requests
 from fastmcp import FastMCP
@@ -24,8 +25,8 @@ mcp = FastMCP(
     version="1.1.0",
 )
 
-# API configuration
-API_BASE_URL = "http://localhost:8080"
+# API configuration - override via AGENT_GENESIS_API_URL env var
+API_BASE_URL = os.environ.get("AGENT_GENESIS_API_URL", "http://localhost:8080")
 API_TIMEOUT = 60  # seconds
 
 
@@ -114,10 +115,10 @@ def search_conversations(
         logger.error("Failed to connect to Agent Genesis API")
         return {
             "error": "API Connection Failed",
-            "message": "Could not connect to Agent Genesis API at localhost:8080. Please ensure the API is running.",
+            "message": f"Could not connect to Agent Genesis API at {API_BASE_URL}. Please ensure the API is running.",
             "troubleshooting": [
-                "Check if Agent Genesis Phase 2 API is running (docker-compose up -d)",
-                "Verify API is accessible at http://localhost:8080/health",
+                "Check if Agent Genesis API is running (docker-compose up -d)",
+                f"Verify API is accessible at {API_BASE_URL}/health",
                 "Check Docker container status: docker ps | grep agent-genesis"
             ]
         }
@@ -210,9 +211,9 @@ def check_api_health() -> dict:
             "message": "Cannot connect to Agent Genesis API",
             "endpoint": API_BASE_URL,
             "troubleshooting": [
-                "Run: docker-compose up -d",
-                "Check: docker ps | grep agent-genesis",
-                "Verify: curl http://localhost:8080/health"
+                "Run on ai-utility: ssh ai-utility 'docker-compose up -d'",
+                "Check: ssh ai-utility 'docker ps | grep agent-genesis'",
+                f"Verify: curl {API_BASE_URL}/health"
             ]
         }
     except Exception as e:
