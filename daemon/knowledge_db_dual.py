@@ -420,14 +420,14 @@ class DualSourceKnowledgeDB:
         except Exception as exc:
             logger.warning("FTS5 search failed: %s — trying vector search", exc)
 
-        # Secondary: Vector search on beta only (alpha segfaults)
+        # Secondary: Vector search (alpha rebuilt from ~2M to ~35K docs, segfault fixed)
         vector_results = None
-        if self._worker.is_available and "beta" in collections:
+        if self._worker.is_available:
             try:
                 vector_results = self._worker.call("query", {
                     "query_text": query_text,
                     "n_results": n_results,
-                    "collections": ["beta"],
+                    "collections": collections,
                     "project_filter": project_filter,
                 })
             except Exception as exc:
@@ -536,7 +536,9 @@ class DualSourceKnowledgeDB:
             }
 
             sqlite_path = os.path.join(self.persist_directory, "chroma.sqlite3")
-            conn = sqlite3.connect(sqlite_path)
+            conn = sqlite3.connect(sqlite_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA read_uncommitted=ON")
             cursor = conn.cursor()
 
             # ChromaDB 1.5+ splits segments into METADATA and VECTOR scopes.

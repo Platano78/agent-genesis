@@ -11,6 +11,8 @@ Provides REST API for:
 import json
 import logging
 import os
+import threading
+import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from typing import Optional
@@ -24,9 +26,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_indexing_lock = threading.Lock()
+_current_job: Optional[dict] = None
+
+
+def _run_indexing_job(job_id: str, enable_mkg: bool) -> None:
+    """Run indexing in a background thread, updating _current_job."""
+    global _current_job
+    try:
+        indexer = ConversationIndexer(enable_mkg_analysis=enable_mkg)
+        stats = indexer.index_all_sources()
+        with _indexing_lock:
+            _current_job = {"job_id": job_id, "status": "complete", "stats": {
+                "alpha_indexed": stats["alpha_indexed"], "beta_indexed": stats["beta_indexed"],
+                "total_indexed": stats["total_indexed"], "duration_seconds": stats["duration"]}}
+    except Exception as exc:
+        logger.error("Background indexing failed: %s", exc)
+        with _indexing_lock:
+            _current_job = {"job_id": job_id, "status": "failed", "error": str(exc)[:500]}
+
 
 def _build_endpoints_list() -> list:
-    return ["/search", "/index/trigger", "/stats", "/live", "/ready", "/health", "/health/deep"]
+    return ["/search", "/index/trigger", "/index/status", "/stats", "/live", "/ready", "/health", "/health/deep"]
 
 
 def _collect_disk_stats(persist_dir: str) -> tuple:
@@ -129,6 +150,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_health_deep()
         elif path == '/stats':
             self.handle_stats()
+        elif path == '/index/status':
+            self.handle_index_status()
         else:
             self.send_error(404, "Endpoint not found")
 
@@ -168,29 +191,28 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json_response({"error": str(e)}, status=500)
 
     def handle_index_trigger(self):
-        """Handle manual indexing trigger."""
+        """Handle manual indexing trigger — starts indexing in background."""
+        global _current_job
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            if content_length > 0:
-                body = self.rfile.read(content_length).decode('utf-8')
-                data = json.loads(body)
-            else:
-                data = {}
-            enable_mkg = data.get('enable_mkg', False)
-            indexer = ConversationIndexer(enable_mkg_analysis=enable_mkg)
-            stats = indexer.index_all_sources()
-            self.send_json_response({
-                "status": "complete",
-                "stats": {
-                    "alpha_indexed": stats["alpha_indexed"],
-                    "beta_indexed": stats["beta_indexed"],
-                    "total_indexed": stats["total_indexed"],
-                    "duration_seconds": stats["duration"],
-                },
-            })
+            data = json.loads(self.rfile.read(content_length).decode()) if content_length > 0 else {}
+            with _indexing_lock:
+                if _current_job and _current_job.get("status") == "running":
+                    self.send_json_response({"status": "already_running", "job_id": _current_job["job_id"]})
+                    return
+            job_id = str(uuid.uuid4())[:8]
+            with _indexing_lock:
+                _current_job = {"job_id": job_id, "status": "running"}
+            threading.Thread(target=_run_indexing_job, args=(job_id, data.get('enable_mkg', False)), daemon=True).start()
+            self.send_json_response({"status": "indexing_started", "job_id": job_id})
         except Exception as e:
             logger.error("Indexing trigger failed: %s", e)
             self.send_json_response({"error": str(e)}, status=500)
+
+    def handle_index_status(self):
+        """Return current indexing job status."""
+        with _indexing_lock:
+            self.send_json_response(_current_job if _current_job else {"status": "no_job"})
 
     def handle_live(self):
         """Ultra-cheap liveness check. No DB calls. Always <1ms."""
@@ -262,9 +284,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_json_response(result, status=status_code)
 
     def handle_stats(self):
-        """Handle collection statistics request."""
+        """Handle collection statistics request (live counts + indexing status)."""
         try:
             stats = self.db.get_collection_stats()
+            with _indexing_lock:
+                if _current_job and _current_job.get("status") == "running":
+                    stats["indexing"] = {"status": "running", "job_id": _current_job["job_id"]}
             self.send_json_response(stats)
         except Exception as e:
             logger.error("Stats retrieval failed: %s", e)

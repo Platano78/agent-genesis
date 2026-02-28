@@ -85,12 +85,16 @@ def main() -> None:
         except Exception as exc:
             logger.error("Failed to load beta collection: %s", exc)
 
-        # Skip alpha collection — 2M+ records cause HNSW segfault.
-        # Alpha is searched via FTS5 in the parent process instead.
-        logger.info(
-            "alpha collection SKIPPED (vector search disabled — "
-            "2M+ record HNSW segfaults; using FTS5 in parent)"
-        )
+        # Load alpha collection (rebuilt from 2M+ to ~35K docs, segfault fixed)
+        try:
+            alpha = client.get_or_create_collection(
+                "alpha_claude_code", embedding_function=ef
+            )
+            alpha_count = alpha.count()
+            collections["alpha"] = alpha
+            logger.info("alpha collection loaded: %d documents", alpha_count)
+        except Exception as exc:
+            logger.warning("Failed to load alpha collection: %s — FTS5 fallback", exc)
 
         if not collections:
             logger.warning("No collections loaded — worker will only handle indexing")

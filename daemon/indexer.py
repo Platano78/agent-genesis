@@ -12,6 +12,8 @@ import glob
 import hashlib
 import json
 import logging
+import os
+import time
 from collections import defaultdict
 from typing import List, Optional
 from pathlib import Path
@@ -20,7 +22,7 @@ from datetime import datetime
 try:
     # Try relative imports first (when run from parent directory)
     from daemon.parser import parse_claude_json, Conversation, Message
-    from daemon.jsonl_parser import scan_projects_directory
+    from daemon.jsonl_parser import scan_projects_directory, parse_jsonl_file
     from daemon.claude_web_parser import ClaudeWebParser
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.embeddings import get_embedding_generator
@@ -28,7 +30,7 @@ try:
 except ImportError:
     # Fall back to direct imports (when run from daemon directory)
     from parser import parse_claude_json, Conversation, Message
-    from jsonl_parser import scan_projects_directory
+    from jsonl_parser import scan_projects_directory, parse_jsonl_file
     from claude_web_parser import ClaudeWebParser
     from knowledge_db_dual import DualSourceKnowledgeDB
     from embeddings import get_embedding_generator
@@ -85,7 +87,7 @@ class ConversationIndexer:
                 except Exception as e:
                     logger.warning(f"Failed to index conversation {convo.id}: {e}")
 
-            logger.info(f"✅ Indexed {indexed} Claude Code conversations to Alpha")
+            logger.info(f"Indexed {indexed} Claude Code conversations to Alpha")
             return indexed
 
         except Exception as e:
@@ -131,7 +133,7 @@ class ConversationIndexer:
                     state = json.load(f)
                 if state.get("md5") == current_md5:
                     logger.info(
-                        f"⏭️  Export unchanged (MD5 match), Beta has data. "
+                        f"Export unchanged (MD5 match), Beta has data. "
                         f"Skipping. Last indexed: {state.get('indexed_at', 'unknown')}"
                     )
                     return 0
@@ -139,7 +141,7 @@ class ConversationIndexer:
                 pass  # Corrupt state file, proceed with reimport
 
         if beta_empty:
-            logger.info("🔄 Beta collection empty — forcing reimport (self-healing)")
+            logger.info("Beta collection empty — forcing reimport (self-healing)")
 
         # Parse the export ZIP
         logger.info(f"Parsing Anthropic export: {zip_path}")
@@ -186,7 +188,7 @@ class ConversationIndexer:
             except Exception as e:
                 logger.warning(f"Failed to index conversation {conv_id}: {e}")
 
-        logger.info(f"✅ Indexed {indexed} web conversations ({total_messages} messages) to Beta")
+        logger.info(f"Indexed {indexed} web conversations ({total_messages} messages) to Beta")
 
         # Write state file for hash-based skip on next run
         try:
@@ -221,36 +223,67 @@ class ConversationIndexer:
         except Exception:
             return True  # If we can't check, assume empty and reimport
 
-    def index_claude_projects_jsonl(self, projects_dir: str, project_filter: Optional[str] = None) -> int:
-        """
-        Index Claude Code JSONL conversations from ~/.claude/projects.
+    def _load_index_manifest(self) -> dict:
+        """Load the manifest tracking which files have been indexed and their mtimes."""
+        manifest_path = Path(self.db.persist_directory) / "alpha_index_manifest.json"
+        if manifest_path.exists():
+            try:
+                with open(manifest_path, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {}
 
-        Args:
-            projects_dir: Path to ~/.claude/projects directory
-            project_filter: Optional project name filter
-
-        Returns:
-            Number of conversations indexed
-        """
-        logger.info(f"Indexing Claude Code JSONL conversations from {projects_dir}")
-
+    def _save_index_manifest(self, manifest: dict) -> None:
+        """Save the index manifest after successful indexing."""
+        manifest_path = Path(self.db.persist_directory) / "alpha_index_manifest.json"
         try:
-            conversations = scan_projects_directory(Path(projects_dir), project_filter)
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f)
+        except OSError as exc:
+            logger.warning("Failed to save index manifest: %s", exc)
 
-            logger.info(f"Parsed {len(conversations)} JSONL conversations")
+    def index_claude_projects_jsonl(self, projects_dir: str, project_filter: Optional[str] = None) -> int:
+        """Index Claude Code JSONL conversations, skipping unchanged files."""
+        logger.info(f"Indexing Claude Code JSONL conversations from {projects_dir}")
+        try:
+            manifest = self._load_index_manifest()
+            projects_path = Path(projects_dir)
+            if not projects_path.exists():
+                logger.error(f"Projects directory not found: {projects_dir}")
+                return 0
 
-            # Index to Collection Alpha
+            # Collect JSONL files that are new or modified since last indexing
+            files_to_parse = []
+            for project_dir in sorted(projects_path.iterdir()):
+                if not project_dir.is_dir():
+                    continue
+                for jsonl_file in project_dir.glob("*.jsonl"):
+                    file_key = str(jsonl_file)
+                    file_mtime = jsonl_file.stat().st_mtime
+                    if file_key in manifest and manifest[file_key] >= file_mtime:
+                        continue  # Unchanged since last indexing
+                    files_to_parse.append((jsonl_file, file_mtime))
+
+            logger.info(f"Found {len(files_to_parse)} new/modified JSONL files (skipped {len(manifest)} unchanged)")
+
+            if not files_to_parse:
+                return 0
+
             indexed = 0
-            for convo in conversations:
+            for jsonl_file, file_mtime in files_to_parse:
                 try:
-                    self._index_conversation(convo, collection="alpha")
-                    indexed += 1
+                    conversation = parse_jsonl_file(jsonl_file)
+                    if conversation:
+                        self._index_conversation(conversation, collection="alpha")
+                        indexed += 1
+                        manifest[str(jsonl_file)] = file_mtime
                 except Exception as e:
-                    logger.warning(f"Failed to index conversation {convo.id}: {e}")
+                    logger.warning(f"Failed to index {jsonl_file}: {e}")
 
-            logger.info(f"✅ Indexed {indexed} JSONL conversations to Alpha")
+            self._save_index_manifest(manifest)
+            logger.info(f"Indexed {indexed} JSONL conversations to Alpha")
             return indexed
-
         except Exception as e:
             logger.error(f"JSONL indexing failed: {e}")
             return 0
@@ -354,7 +387,7 @@ def run_initial_indexing():
     if stats['errors']:
         print(f"\nErrors encountered:")
         for error in stats['errors']:
-            print(f"  ⚠️  {error}")
+            print(f"  {error}")
 
     # Show collection stats
     try:
@@ -365,10 +398,10 @@ def run_initial_indexing():
         print(f"  Alpha: {alpha_count} documents")
         print(f"  Beta:  {beta_count} documents")
     except Exception as e:
-        print(f"\n⚠️  Could not retrieve collection stats: {e}")
+        print(f"\n  Could not retrieve collection stats: {e}")
 
     print("\n" + "=" * 50)
-    print("✅ INITIAL INDEXING COMPLETE")
+    print("INITIAL INDEXING COMPLETE")
     print("=" * 50)
 
 
