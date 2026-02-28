@@ -109,6 +109,9 @@ class FTSSearchEngine:
         if not query_text or not query_text.strip():
             raise ValueError("query_text cannot be empty")
 
+        # Refresh segment map to pick up newly indexed data
+        self._load_segment_map()
+
         fts_query = self._build_fts_query(query_text)
         fetch_limit = n_results * 5
 
