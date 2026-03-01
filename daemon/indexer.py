@@ -1,5 +1,4 @@
-"""
-Conversation indexing orchestrator.
+"""Conversation indexing orchestrator.
 
 Coordinates:
 1. Parsing conversations (JSON + Anthropic export)
@@ -23,6 +22,7 @@ try:
     # Try relative imports first (when run from parent directory)
     from daemon.parser import parse_claude_json, Conversation, Message
     from daemon.jsonl_parser import scan_projects_directory, parse_jsonl_file
+    from daemon.memory_parser import parse_memory_file, scan_memory_files
     from daemon.claude_web_parser import ClaudeWebParser
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.embeddings import get_embedding_generator
@@ -31,6 +31,7 @@ except ImportError:
     # Fall back to direct imports (when run from daemon directory)
     from parser import parse_claude_json, Conversation, Message
     from jsonl_parser import scan_projects_directory, parse_jsonl_file
+    from memory_parser import parse_memory_file, scan_memory_files
     from claude_web_parser import ClaudeWebParser
     from knowledge_db_dual import DualSourceKnowledgeDB
     from embeddings import get_embedding_generator
@@ -141,7 +142,7 @@ class ConversationIndexer:
                 pass  # Corrupt state file, proceed with reimport
 
         if beta_empty:
-            logger.info("Beta collection empty — forcing reimport (self-healing)")
+            logger.info("Beta collection empty \u2014 forcing reimport (self-healing)")
 
         # Parse the export ZIP
         logger.info(f"Parsing Anthropic export: {zip_path}")
@@ -288,6 +289,36 @@ class ConversationIndexer:
             logger.error(f"JSONL indexing failed: {e}")
             return 0
 
+    def index_memory_files(self, projects_dir: str) -> int:
+        """Index Claude Code memory markdown files, skipping unchanged."""
+        logger.info("Indexing memory files from %s", projects_dir)
+        try:
+            manifest = self._load_index_manifest()
+            memory_files = scan_memory_files(projects_dir)
+            files_to_parse = [
+                (mf, mf.stat().st_mtime) for mf in memory_files
+                if str(mf) not in manifest or manifest[str(mf)] < mf.stat().st_mtime
+            ]
+            logger.info("Found %d new/modified memory files", len(files_to_parse))
+            if not files_to_parse:
+                return 0
+            indexed = 0
+            for mf, mtime in files_to_parse:
+                try:
+                    conv = parse_memory_file(mf)
+                    if conv:
+                        self._index_conversation(conv, collection="alpha")
+                        indexed += 1
+                        manifest[str(mf)] = mtime
+                except Exception as exc:
+                    logger.warning("Failed to index memory file %s: %s", mf, exc)
+            self._save_index_manifest(manifest)
+            logger.info("Indexed %d memory files to Alpha", indexed)
+            return indexed
+        except Exception as exc:
+            logger.error("Memory file indexing failed: %s", exc)
+            return 0
+
     def index_all_sources(
         self,
         projects_dir: str = "/app/data/claude-projects",
@@ -308,6 +339,7 @@ class ConversationIndexer:
         stats = {
             "start_time": datetime.now(),
             "alpha_indexed": 0,
+            "memory_indexed": 0,
             "beta_indexed": 0,
             "total_indexed": 0,
             "errors": []
@@ -322,6 +354,13 @@ class ConversationIndexer:
         else:
             logger.warning(f"Projects directory not found: {projects_dir}")
 
+        # Index Claude Code memory files (Alpha)
+        if Path(projects_dir).exists():
+            try:
+                stats["memory_indexed"] = self.index_memory_files(projects_dir)
+            except Exception as e:
+                stats["errors"].append(f"Memory file indexing: {e}")
+
         # Index Anthropic web export (Beta)
         if Path(exports_dir).exists():
             try:
@@ -331,7 +370,7 @@ class ConversationIndexer:
         else:
             logger.warning(f"Exports directory not found: {exports_dir}")
 
-        stats["total_indexed"] = stats["alpha_indexed"] + stats["beta_indexed"]
+        stats["total_indexed"] = stats["alpha_indexed"] + stats["memory_indexed"] + stats["beta_indexed"]
         stats["end_time"] = datetime.now()
         stats["duration"] = (stats["end_time"] - stats["start_time"]).total_seconds()
 
@@ -380,6 +419,7 @@ def run_initial_indexing():
     # Print results
     print("\nIndexing Results:")
     print(f"  Alpha (Claude Code):    {stats['alpha_indexed']} conversations")
+    print(f"  Memory files:           {stats['memory_indexed']} files")
     print(f"  Beta (Web Export):      {stats['beta_indexed']} conversations")
     print(f"  Total:                  {stats['total_indexed']} conversations")
     print(f"  Duration:               {stats['duration']:.1f}s")

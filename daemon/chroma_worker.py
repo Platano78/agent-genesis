@@ -194,7 +194,7 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
     conversation_id = conv.get("id", str(uuid.uuid4()))
     conv_meta = {
         "project": conv.get("project", ""),
-        "source": "jsonl",
+        "source": conv.get("source") or "jsonl",
         "cwd": conv.get("cwd", ""),
         "git_branch": conv.get("git_branch", ""),
     }

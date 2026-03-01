@@ -28,6 +28,7 @@ class Conversation:
     timestamp: datetime
     messages: List[Message]
     project: Optional[str] = None
+    source: Optional[str] = None
     cwd: Optional[str] = None
     git_branch: Optional[str] = None
 

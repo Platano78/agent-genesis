@@ -562,9 +562,28 @@ class DualSourceKnowledgeDB:
                     stats[simple_name]["count"] = count
                     total_count += count
 
+            # Populate distinct projects and sources per collection
+            for meta_key, stats_key in [("project", "projects"), ("source", "sources")]:
+                cursor.execute("""
+                    SELECT c.name, em.string_value
+                    FROM embedding_metadata em
+                    JOIN embeddings e ON e.id = em.id
+                    JOIN segments s ON s.id = e.segment_id
+                    JOIN collections c ON c.id = s.collection
+                    WHERE em.key = ? AND s.scope = 'METADATA'
+                      AND em.string_value IS NOT NULL AND em.string_value != ''
+                    GROUP BY c.name, em.string_value
+                """, (meta_key,))
+                for chroma_name, value in cursor.fetchall():
+                    simple_name = collection_name_map.get(chroma_name)
+                    if simple_name and value not in stats[simple_name][stats_key]:
+                        stats[simple_name][stats_key].append(value)
+
             conn.close()
 
-            stats["total"] = {"count": total_count, "sources": [], "projects": []}
+            all_projects = sorted(set(stats["alpha"]["projects"] + stats["beta"]["projects"]))
+            all_sources = sorted(set(stats["alpha"]["sources"] + stats["beta"]["sources"]))
+            stats["total"] = {"count": total_count, "sources": all_sources, "projects": all_projects}
             logger.info(
                 f"Retrieved stats for all collections: {total_count} total messages"
             )
