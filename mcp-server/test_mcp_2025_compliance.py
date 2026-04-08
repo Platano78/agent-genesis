@@ -9,6 +9,7 @@ This script validates compliance with the MCP 2025-11-25 specification.
 import json
 import sys
 import os
+import tomllib
 from datetime import datetime
 
 # Test results tracking
@@ -230,11 +231,28 @@ def test_pyproject_config():
     else:
         log_test("FastMCP dependency declared", False, "No fastmcp in dependencies")
     
-    # Check for version
-    if 'version = "1.1.0"' in content:
-        log_test("Version 1.1.0 in pyproject", True)
+    try:
+        pyproject = tomllib.loads(content)
+        pyproject_version = pyproject["project"]["version"]
+        log_test("Project version declared", True)
+    except Exception as exc:
+        log_test("Project version declared", False, f"Unable to parse pyproject version: {exc}")
+        return
+
+    server_file = os.path.join(os.path.dirname(__file__), "agent_genesis_mcp.py")
+    with open(server_file, 'r') as f:
+        server_content = f.read()
+
+    expected_snippet = f'version="{pyproject_version}"'
+    alternate_snippet = f"version='{pyproject_version}'"
+    if expected_snippet in server_content or alternate_snippet in server_content:
+        log_test("Server version matches pyproject", True)
     else:
-        log_test("Version 1.1.0 in pyproject", False, "Version mismatch in pyproject.toml")
+        log_test(
+            "Server version matches pyproject",
+            False,
+            f"Expected FastMCP version {pyproject_version}"
+        )
 
 def generate_report():
     """Generate final test report"""

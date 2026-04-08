@@ -84,9 +84,10 @@ def run_startup_checks(persist_directory: str = "/app/knowledge") -> dict:
     else:
         msg = (
             f"beta_claude_desktop collection is EMPTY (0 documents). "
-            f"Run import_to_container.py to populate it. "
-            f"Example: docker exec agent-genesis python import_to_container.py "
-            f"data-2025-11-22-16-43-55-batch-0000.zip"
+            f"Import a Claude export ZIP into /app/data/exports and trigger indexing "
+            f"to populate it. Example: docker cp /path/to/data-export.zip "
+            f"agent-genesis:/app/data/exports/ && curl -X POST "
+            f"http://localhost:8080/index/trigger"
         )
         logger.critical("startup_checks: %s", msg)
         warnings.append(msg)

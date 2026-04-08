@@ -4,6 +4,8 @@
 
 This package provides an MCP (Model Context Protocol) server that enables Claude Code to search through your conversation history using the Agent Genesis API.
 
+Current package version: `1.3.0`
+
 ## Prerequisites
 
 - Python 3.10+
@@ -29,8 +31,8 @@ pip install -e .
 
 Add to your Claude Code configuration:
 
-**Linux/macOS:** `~/.claude/claude_desktop_config.json`
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+**Linux/macOS:** `~/.claude.json`
+**Windows:** `%USERPROFILE%\.claude.json`
 
 ```json
 {
@@ -140,6 +142,17 @@ index_conversations(full_reindex=True, force=True)
 index_conversations(time_range="24h")
 ```
 
+## Available Resources
+
+- `config://api-endpoints` - API endpoint documentation
+- `agentgenesis://stats` - Current corpus statistics
+- `agentgenesis://health` - Current API health status
+
+## Available Prompts
+
+- `search_conversations_workflow` - Guided workflow for building and refining searches
+- `trigger_indexing_workflow` - Guided workflow for manual indexing and scheduler operations
+
 ## API Configuration
 
 By default, the MCP server connects to `http://localhost:8080`.
@@ -184,8 +197,11 @@ cd agent-genesis/mcp-server
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests
-pytest
+# Validate MCP compliance
+python3 test_mcp_2025_compliance.py
+
+# Run the interactive MCP smoke test
+python3 test_mcp.py
 
 # Format code
 black .

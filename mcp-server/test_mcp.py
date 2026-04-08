@@ -31,14 +31,22 @@ async def test_tool_discovery():
         for tool in tools:
             print(f"  - {tool.name}: {tool.description}")
 
-        expected_tools = {"search_conversations", "get_api_stats", "check_api_health"}
+        expected_tools = {
+            "search_conversations",
+            "get_api_stats",
+            "check_api_health",
+            "manage_scheduler",
+            "index_conversations",
+        }
         found_tools = {tool.name for tool in tools}
 
-        if expected_tools == found_tools:
+        missing_tools = expected_tools - found_tools
+
+        if not missing_tools:
             print("\n✓ All expected tools are registered")
             return True
         else:
-            print(f"\n✗ Missing tools: {expected_tools - found_tools}")
+            print(f"\n✗ Missing tools: {missing_tools}")
             return False
 
 

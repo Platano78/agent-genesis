@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # MCP 2025-11-25 compliant with explicit version and capabilities
 mcp = FastMCP(
     name="Agent Genesis",
-    version="1.1.0",
+    version="1.3.0",
 )
 
 # API configuration - override via AGENT_GENESIS_API_URL env var
@@ -218,8 +218,8 @@ def check_api_health() -> dict:
             "message": "Cannot connect to Agent Genesis API",
             "endpoint": API_BASE_URL,
             "troubleshooting": [
-                "Run on ai-utility: ssh ai-utility 'docker-compose up -d'",
-                "Check: ssh ai-utility 'docker ps | grep agent-genesis'",
+                "Start the Agent Genesis container or API service",
+                "Check that the configured host is reachable and serving the API",
                 f"Verify: curl {API_BASE_URL}/health"
             ]
         }

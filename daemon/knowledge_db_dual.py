@@ -1,6 +1,7 @@
 """Dual-collection knowledge database for multi-source conversation indexing.
 
-This module provides search across two distinct data sources (JSON and LevelDB)
+This module provides search across two distinct data sources (Claude Code and
+Claude export imports)
 using a hybrid approach:
   - SQLite FTS5 for fast full-text search across all collections (primary)
   - ChromaDB vector search for semantic search on small collections (secondary)

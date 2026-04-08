@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 
 try:
-    # Try relative imports first (when run from parent directory)
+    # Try package-relative imports first (when run from the repository root).
     from daemon.parser import parse_claude_json, Conversation, Message
     from daemon.jsonl_parser import scan_projects_directory, parse_jsonl_file
     from daemon.memory_parser import parse_memory_file, scan_memory_files
@@ -27,8 +27,13 @@ try:
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.embeddings import get_embedding_generator
     from daemon.mkg_client import MKGClient
-except ImportError:
-    # Fall back to direct imports (when run from daemon directory)
+except ModuleNotFoundError as exc:
+    # Only fall back when the daemon package itself is unavailable, such as when
+    # running this file directly from inside the daemon directory. If an optional
+    # dependency is missing, re-raise so callers see the real root cause.
+    if not exc.name or not exc.name.startswith("daemon"):
+        raise
+
     from parser import parse_claude_json, Conversation, Message
     from jsonl_parser import scan_projects_directory, parse_jsonl_file
     from memory_parser import parse_memory_file, scan_memory_files
@@ -158,7 +163,7 @@ class ConversationIndexer:
             f"({metrics.failed_conversations} failed, {metrics.schema_errors} schema errors)"
         )
 
-        # Group messages by conversation_id (pattern from import_to_container.py)
+        # Group messages by conversation_id before indexing into the beta collection.
         conversations_dict = defaultdict(list)
         for msg in messages:
             conversations_dict[msg.conversation_id].append(msg)

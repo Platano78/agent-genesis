@@ -2,7 +2,6 @@
 # Copy to docker-compose.yml and configure paths for your system
 #
 # Required environment variables (set in .env file or export):
-#   CLAUDE_DESKTOP_LEVELDB_PATH - Path to Claude Desktop LevelDB
 #   CLAUDE_PROJECTS_PATH - Path to Claude Code projects directory
 
 version: '3.8'
@@ -31,20 +30,17 @@ services:
       # Persistent knowledge database
       - genesis-knowledge:/app/knowledge
 
-      # Claude Desktop LevelDB (read-only)
-      # Windows: /mnt/c/Users/YOUR_USERNAME/AppData/Roaming/Claude/Local Storage/leveldb
-      # macOS: ~/Library/Application Support/Claude/Local Storage/leveldb
-      # Linux: ~/.config/Claude/Local Storage/leveldb
-      - type: bind
-        source: ${CLAUDE_DESKTOP_LEVELDB_PATH}
-        target: /app/data/claude-desktop-leveldb
-        read_only: true
-
       # Claude Code projects directory (read-only)
       # All platforms: ~/.claude/projects
       - type: bind
         source: ${CLAUDE_PROJECTS_PATH}
         target: /app/data/claude-projects
+        read_only: true
+
+      # Optional Claude export ZIPs for Claude.ai / Claude Desktop import
+      - type: bind
+        source: ./exports
+        target: /app/data/exports
         read_only: true
 
     networks:

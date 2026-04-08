@@ -478,6 +478,15 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Changelog
 
+### v1.3.0 (2026-04-08)
+- MCP server updated to align package and runtime version metadata at `1.3.0`
+- Added MCP resources and prompts for MCP 2025-11-25 compliance
+- Added scheduler management and manual indexing MCP tools to the documented tool surface
+- Fixed MCP validation scripts to verify the current release dynamically instead of hard-coding stale versions
+- Improved daemon import fallback so missing optional dependencies report the real error cause
+- Removed stale Claude Desktop LevelDB setup references from the public setup flow
+- Generalized sync tooling so the tracked script no longer contains personal infrastructure hooks
+
 ### v1.2.0 (2025-01-02)
 - Complete documentation rewrite
 - Fixed: Removed incorrect LevelDB claims (Claude.ai uses cloud storage)
