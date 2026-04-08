@@ -230,7 +230,7 @@ class ChromaWorkerClient:
     """
 
     _READY_TIMEOUT = 60
-    _RPC_TIMEOUT = 30
+    _RPC_TIMEOUT = 120
 
     def __init__(self, persist_directory: str, embedding_model_name: str) -> None:
         self.persist_directory = persist_directory

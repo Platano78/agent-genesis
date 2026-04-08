@@ -46,7 +46,8 @@ class ConversationIndexer:
     def __init__(
         self,
         db_path: str = "/app/knowledge",
-        enable_mkg_analysis: bool = False
+        enable_mkg_analysis: bool = False,
+        db: "DualSourceKnowledgeDB | None" = None
     ):
         """
         Initialize indexer.
@@ -54,8 +55,9 @@ class ConversationIndexer:
         Args:
             db_path: ChromaDB persistence directory
             enable_mkg_analysis: Whether to enrich with MKG analysis
+            db: Optional shared DualSourceKnowledgeDB instance (avoids duplicate ChromaDB workers)
         """
-        self.db = DualSourceKnowledgeDB(persist_directory=db_path)
+        self.db = db if db is not None else DualSourceKnowledgeDB(persist_directory=db_path)
         self.embedding_gen = get_embedding_generator()
         self.mkg_client = MKGClient() if enable_mkg_analysis else None
         self.enable_mkg = enable_mkg_analysis
@@ -344,6 +346,18 @@ class ConversationIndexer:
             "total_indexed": 0,
             "errors": []
         }
+
+        # Wait for ChromaDB worker to be ready (may still be loading embeddings model)
+        import time
+        for attempt in range(30):
+            if hasattr(self.db, '_worker') and self.db._worker.is_available:
+                break
+            logger.info("Waiting for ChromaDB worker... (%d/30)", attempt + 1)
+            time.sleep(2)
+        else:
+            logger.error("ChromaDB worker not available after 60s, aborting indexing")
+            stats["errors"].append("ChromaDB worker timeout")
+            return stats
 
         # Index Claude Code JSONL (Alpha) - PRIMARY SOURCE
         if Path(projects_dir).exists():

@@ -34,7 +34,7 @@ def _run_indexing_job(job_id: str, enable_mkg: bool) -> None:
     """Run indexing in a background thread, updating _current_job."""
     global _current_job
     try:
-        indexer = ConversationIndexer(enable_mkg_analysis=enable_mkg)
+        indexer = ConversationIndexer(enable_mkg_analysis=enable_mkg, db=APIHandler.db)
         stats = indexer.index_all_sources()
         with _indexing_lock:
             _current_job = {"job_id": job_id, "status": "complete", "stats": {

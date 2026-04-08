@@ -91,15 +91,22 @@ def search_conversations(
             distance = result.get("distance", 1.0)
             similarity_score = round(1.0 - distance, 3)
 
+            document = result.get("document", "")
+            preview = metadata.get("user_message_preview", "")
+            snippet = preview if preview else document[:500]
+            if len(snippet) > 500:
+                snippet = snippet[:500] + "..."
+
             formatted_results.append({
                 "score": similarity_score,
                 "project": metadata.get("project", "unknown"),
-                "timestamp": metadata.get("timestamp", ""),
+                "timestamp": metadata.get("conversation_timestamp", metadata.get("timestamp", "")),
                 "conversation_id": metadata.get("conversation_id", ""),
-                "content_snippet": result.get("document", "")[:200] + "..." if len(result.get("document", "")) > 200 else result.get("document", ""),
-                "full_content_length": len(result.get("document", "")),
+                "content_snippet": snippet,
+                "matched_chunk": document[:500],
+                "chunk_type": metadata.get("chunk_type", "unknown"),
+                "message_count": metadata.get("message_count", 0),
                 "git_branch": metadata.get("git_branch", ""),
-                "role": metadata.get("role", "")
             })
 
         return {

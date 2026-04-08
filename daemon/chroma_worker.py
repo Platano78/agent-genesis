@@ -190,7 +190,6 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
         # Create/get collection for indexing even if not used for search
         target = client.get_or_create_collection(chroma_name, embedding_function=ef)
 
-    messages = conv.get("messages", [])
     conversation_id = conv.get("id", str(uuid.uuid4()))
     conv_meta = {
         "project": conv.get("project", ""),
@@ -199,34 +198,20 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
         "git_branch": conv.get("git_branch", ""),
     }
 
-    documents, metadatas, ids = [], [], []
-    for msg_idx, msg in enumerate(messages):
-        content = msg.get("content", "")
-        if not content.strip():
-            continue
-        ts = msg.get("timestamp", datetime.utcnow())
-        ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
-        documents.append(content)
-        metadatas.append({
-            "conversation_id": conversation_id,
-            "role": msg.get("role", "unknown"),
-            "timestamp": ts_str,
-            "project": conv_meta["project"],
-            "source": conv_meta["source"],
-            "cwd": conv_meta["cwd"],
-            "git_branch": conv_meta["git_branch"],
-        })
-        # Deterministic ID: same conversation + message index = same ID
-        # Prevents duplicates on reindex
-        doc_id = hashlib.sha256(
-            f"{conversation_id}:{msg_idx}:{content[:200]}".encode()
-        ).hexdigest()[:36]
-        ids.append(doc_id)
+    from daemon.conversation_chunker import chunk_conversation
+    chunks = chunk_conversation(conv, conv_meta)
 
-    if documents:
-        target.upsert(documents=documents, metadatas=metadatas, ids=ids)
+    if chunks:
+        # Batch upserts to avoid timeout on large conversations
+        BATCH_SIZE = 20
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batch = chunks[i:i + BATCH_SIZE]
+            documents = [c["document"] for c in batch]
+            metadatas = [c["metadata"] for c in batch]
+            ids = [c["doc_id"] for c in batch]
+            target.upsert(documents=documents, metadatas=metadatas, ids=ids)
         logger.info(
-            "Indexed %d messages from %s into %s", len(documents), conversation_id, collection
+            "Indexed %d chunks from %s into %s", len(chunks), conversation_id, collection
         )
 
 
