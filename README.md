@@ -410,6 +410,24 @@ The service needs ~4-6GB RAM for the embedding model. Increase Docker memory:
 | `/stats` | GET | Conversation counts per collection |
 | `/search` | POST | Search conversations |
 | `/index/trigger` | POST | Trigger indexing |
+| `/index/status` | GET | Poll current indexing job status (`no_job`, `running`, `complete`, `failed`) |
+
+### Nightly sync script — optional Faulkner-DB integration
+
+`scripts/sync-and-index.sh` rsyncs your Claude Code conversations to the remote host, triggers indexing, and optionally runs the [Faulkner-DB](https://github.com/Platano78/faulkner-db) relationship extractor after indexing completes. This chains together the sync + indexing + knowledge-graph update as a single nightly job.
+
+Set these env vars (in a wrapper script, cron environment, or your scheduler's env section) to enable the extractor step:
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `GENESIS_REMOTE_HOST` | SSH target where Agent Genesis runs | `user@my-server` |
+| `FAULKNER_REPO` | Local path to faulkner-db checkout (needed for extractor venv) | `~/project/faulkner-db` |
+| `FAULKNER_LLM_ENDPOINT` | OpenAI-compatible base URL for relationship classification | `http://localhost:8081/v1` |
+| `FALKORDB_HOST` / `FALKORDB_PORT` / `FALKORDB_PASSWORD` / `FALKORDB_GRAPH` | FalkorDB connection for extractor | See [faulkner-db docs](https://github.com/Platano78/faulkner-db) |
+
+The extractor step is skipped gracefully if the faulkner-db venv or state file is missing, so the sync works fine without it. A 20-hour run-gate on `reports/extraction_state.json` mtime prevents re-running within the same day.
+
+The script also rsyncs `~/.claude/docs/` to the remote host's QMD doc store (for session-handoff files and other persistent notes that should be searchable across sessions). Safe no-op if the directory doesn't exist.
 
 ---
 

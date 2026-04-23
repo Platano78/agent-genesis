@@ -11,10 +11,21 @@ Uses local LLM (zero cloud API costs).
 
 import json
 import logging
+import os
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
+import requests
+
 logger = logging.getLogger(__name__)
+
+# Override via AGENT_GENESIS_LLM_ENDPOINT env var.
+# Pass the full chat-completions URL (OpenAI-compatible; llama.cpp, vLLM, LM Studio, etc.).
+LLM_ENDPOINT = os.environ.get(
+    'AGENT_GENESIS_LLM_ENDPOINT',
+    'http://localhost:8084/v1/chat/completions'
+)
+LLM_TIMEOUT_SECONDS = 60
 
 
 class MKGClient:
@@ -176,40 +187,35 @@ Conversation:
         """
         tokens = max_tokens or self.max_tokens
 
-        # MKG is available via MCP tools in the parent Claude instance
-        # For container execution, we'll use a simple HTTP call to the health endpoint
-        # which will be extended to support MKG queries
-
-        # For now, use direct model call if available
-        try:
-            # Check if running in container vs development
-            if Path("/.dockerenv").exists():
-                # In container - use placeholder for now
-                # TODO: Implement HTTP endpoint for MKG access
-                logger.warning("Container MKG access not yet implemented")
-                return '{"decisions": [], "summary": "Analysis pending MKG integration"}'
-            else:
-                # Development mode - could use subprocess to call MKG
-                # For Phase 2, we'll implement HTTP endpoint
-                return self._mock_analysis(prompt)
-
-        except Exception as e:
-            logger.error(f"MKG call failed: {e}")
-            raise
-
-    def _mock_analysis(self, prompt: str) -> str:
-        """Mock analysis for testing (Phase 2 initial deployment)."""
-        return json.dumps({
-            "decisions": [
-                {
-                    "decision": "Example decision from conversation",
-                    "context": "Technical requirement identified",
-                    "reasoning": "Optimal approach for constraints",
-                    "outcome": "Implementation successful"
-                }
+        payload = {
+            'model': self.model,
+            'messages': [
+                {'role': 'system', 'content': 'You are a knowledge analyst. Respond with valid JSON only.'},
+                {'role': 'user', 'content': prompt},
             ],
-            "summary": "Conversation analyzed (mock mode - replace with real MKG)"
-        })
+            'max_tokens': tokens,
+            'temperature': 0.3,
+        }
+
+        try:
+            response = requests.post(
+                LLM_ENDPOINT,
+                json=payload,
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+        except requests.Timeout:
+            logger.error(f"LLM call timed out after {LLM_TIMEOUT_SECONDS}s at {LLM_ENDPOINT}")
+            return json.dumps({'error': {'type': 'llm_timeout', 'endpoint': LLM_ENDPOINT}})
+        except requests.RequestException as e:
+            logger.error(f"LLM call failed at {LLM_ENDPOINT}: {e}")
+            return json.dumps({'error': {'type': 'llm_unreachable', 'detail': str(e)}})
+
+        data = response.json()
+        choices = data.get('choices', [])
+        if not choices:
+            return json.dumps({'error': {'type': 'llm_empty_response', 'detail': 'no choices in response'}})
+        return choices[0].get('message', {}).get('content', '').strip()
 
     def _parse_analysis_result(self, result: str, focus: str) -> Dict[str, Any]:
         """Parse MKG response into structured format."""
