@@ -1,12 +1,41 @@
 """
-MKG (DeepSeek Bridge) Client for Agent Genesis.
+Local LLM client for Agent Genesis (optional enrichment layer).
 
-Leverages existing MKG infrastructure for:
-- Decision extraction from conversations
-- Pattern analysis
-- Context summarization
+This module is an OPTIONAL helper for users who want the indexer to enrich
+each conversation with LLM-generated metadata (summaries, extracted decisions,
+identified patterns) while it indexes. It is NOT required for standard Agent
+Genesis usage — search, indexing, stats, and the MCP server all work fine
+without it.
 
-Uses local LLM (zero cloud API costs).
+When is this used?
+    Only when `ConversationIndexer(enable_mkg_analysis=True)` is set (it
+    defaults to False everywhere in-tree). If you pass the flag, each indexed
+    conversation gets an extra HTTP call to generate a 150-word summary that's
+    stored alongside the ChromaDB embedding.
+
+What does it need?
+    An OpenAI-compatible chat/completions endpoint reachable from the indexer
+    process. Any of these work out of the box:
+    - llama.cpp server (llama-server --host 0.0.0.0 --port 8084 ...)
+    - vLLM             (vllm serve <model> ...)
+    - LM Studio        (local server mode, OpenAI-compatible API)
+    - Ollama           (with OLLAMA_HOST bound and OpenAI-compat proxy)
+    - NVIDIA NIM, Groq, OpenAI itself — anything that speaks the API.
+
+    Configure via the AGENT_GENESIS_LLM_ENDPOINT env var. Default is a local
+    llama.cpp on port 8084. No auth headers are sent, so if your endpoint
+    requires a bearer token you'll need to front it with a proxy that injects
+    one (or extend this module).
+
+Why the kwarg is still named `enable_mkg_analysis`:
+    Backward compatibility. Existing callers pass that kwarg name. The
+    underlying helper used to be named after the author's private LLM gateway
+    ("MKG"); this module now provides a generic OpenAI-compatible client
+    instead, but renaming the public kwarg would break downstream callers.
+
+Cost:
+    Zero cloud cost when pointed at a local endpoint. Whatever your LLM host's
+    token pricing is when pointed at a cloud endpoint.
 """
 
 import json
@@ -28,15 +57,19 @@ LLM_ENDPOINT = os.environ.get(
 LLM_TIMEOUT_SECONDS = 60
 
 
-class MKGClient:
-    """Client for MKG (Mecha King Ghidorah) DeepSeek Bridge."""
+class LocalLLMClient:
+    """Generic OpenAI-compatible chat/completions client for enrichment tasks."""
 
-    def __init__(self, model: str = "qwen3"):
+    def __init__(self, model: str = "local"):
         """
-        Initialize MKG client.
+        Initialize the client.
 
         Args:
-            model: MKG model to use (qwen3, deepseek3.1, local, gemini)
+            model: Model name sent in the request body. Most local servers
+                (llama.cpp, vLLM, LM Studio) ignore this and use whatever model
+                they've loaded; cloud endpoints (OpenAI, NVIDIA NIM, Groq)
+                require a specific name. Default 'local' is safe for
+                llama.cpp-style servers.
         """
         self.model = model
         self.max_tokens = 4000  # Conservative for analysis tasks
@@ -176,14 +209,14 @@ Conversation:
 
     def _call_mkg(self, prompt: str, max_tokens: Optional[int] = None) -> str:
         """
-        Call MKG via subprocess (leverages existing MCP server).
+        POST to the configured OpenAI-compatible chat/completions endpoint.
 
         Args:
             prompt: Prompt to send
             max_tokens: Override default max_tokens
 
         Returns:
-            MKG response text
+            Response text (content of the first choice's message).
         """
         tokens = max_tokens or self.max_tokens
 
@@ -218,7 +251,7 @@ Conversation:
         return choices[0].get('message', {}).get('content', '').strip()
 
     def _parse_analysis_result(self, result: str, focus: str) -> Dict[str, Any]:
-        """Parse MKG response into structured format."""
+        """Parse the LLM response into a structured dict."""
         try:
             # Handle JSON responses
             if result.strip().startswith('{') or result.strip().startswith('['):
@@ -243,9 +276,16 @@ Conversation:
             return {"summary": result, "raw": result}
 
 
-def test_mkg_client():
-    """Test MKG client functionality."""
-    client = MKGClient()
+# Backward-compat alias. The class was previously named after the author's private
+# LLM gateway; the new name reflects what it actually is. Old imports like
+# `from daemon.mkg_client import MKGClient` will still work via this alias and
+# the file location is preserved by git history (git mv).
+MKGClient = LocalLLMClient
+
+
+def test_local_llm_client():
+    """Smoke-test the client end-to-end against whatever endpoint is configured."""
+    client = LocalLLMClient()
 
     test_conversation = """
     User: I'm working on Empire's Edge pathfinding. Should I use A* or Dijkstra?
@@ -273,4 +313,4 @@ def test_mkg_client():
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    test_mkg_client()
+    test_local_llm_client()

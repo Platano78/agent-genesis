@@ -26,7 +26,7 @@ try:
     from daemon.claude_web_parser import ClaudeWebParser
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.embeddings import get_embedding_generator
-    from daemon.mkg_client import MKGClient
+    from daemon.local_llm_client import LocalLLMClient
 except ModuleNotFoundError as exc:
     # Only fall back when the daemon package itself is unavailable, such as when
     # running this file directly from inside the daemon directory. If an optional
@@ -40,7 +40,7 @@ except ModuleNotFoundError as exc:
     from claude_web_parser import ClaudeWebParser
     from knowledge_db_dual import DualSourceKnowledgeDB
     from embeddings import get_embedding_generator
-    from mkg_client import MKGClient
+    from local_llm_client import LocalLLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class ConversationIndexer:
         """
         self.db = db if db is not None else DualSourceKnowledgeDB(persist_directory=db_path)
         self.embedding_gen = get_embedding_generator()
-        self.mkg_client = MKGClient() if enable_mkg_analysis else None
+        self.mkg_client = LocalLLMClient() if enable_mkg_analysis else None
         self.enable_mkg = enable_mkg_analysis
 
         logger.info("Indexer initialized")
