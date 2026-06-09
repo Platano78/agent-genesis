@@ -68,6 +68,17 @@ if [[ -d "$CLAUDE_DOCS_LOCAL" ]]; then
     || log "WARNING: claude-docs rsync failed (non-fatal)"
 fi
 
+# Sync the remaining WSL-sourced QMD collections (memory, skills, agents) to
+# ai-utility. These had no refresh job and froze Mar-Apr 2026; this restores
+# them. Like claude-docs above, reindex is left to Phase 4's 5:30am
+# nightly-synthesis.py (qmd update && qmd embed), so we pass --no-reindex.
+QMD_KNOWLEDGE_SYNC="${QMD_KNOWLEDGE_SYNC:-$HOME/.claude/scripts/qmd-knowledge-sync.sh}"
+if [[ -x "$QMD_KNOWLEDGE_SYNC" ]]; then
+  log "Syncing QMD memory/skills/agents collections (--no-reindex)"
+  QMD_REMOTE="$REMOTE_HOST" "$QMD_KNOWLEDGE_SYNC" --no-reindex 2>&1 | tee -a "$LOG_FILE" \
+    || log "WARNING: qmd-knowledge-sync failed (non-fatal)"
+fi
+
 # --- Phase 3: Faulkner relationship extractor ---------------------------------
 # Poll /index/status until complete (indexing is async since v1.2.3), then run
 # the extractor incrementally so Faulkner stays fresh for Phase 4 synthesis.
@@ -103,7 +114,16 @@ log "Polling /index/status for completion (timeout ${INDEX_POLL_MAX}s)"
 INDEX_STATE=$(poll_index_status)
 log "Indexing finished state: $INDEX_STATE"
 
-if [[ "$INDEX_STATE" != "complete" && "$INDEX_STATE" != "no_job" ]]; then
+# 2026-06-09: graph audit found ~90% of extracted edges were similarity noise
+# (threshold 0.7, no per-node cap). Graph pruned 249->102 nodes / 15k->712
+# edges; extractor fixed same day (default threshold now env/0.85, max 5
+# similarity edges per node, near-duplicate guard at 0.97). Kill switch:
+# set FAULKNER_EXTRACTOR_ENABLED=0 to pause it again.
+FAULKNER_EXTRACTOR_ENABLED="${FAULKNER_EXTRACTOR_ENABLED:-1}"
+
+if [[ "$FAULKNER_EXTRACTOR_ENABLED" != "1" ]]; then
+  log "Faulkner extractor PAUSED (2026-06-09 audit; set FAULKNER_EXTRACTOR_ENABLED=1 to re-enable)"
+elif [[ "$INDEX_STATE" != "complete" && "$INDEX_STATE" != "no_job" ]]; then
   log "Skipping Faulkner extractor (indexing did not reach complete/no_job)"
 else
   SKIP_EXTRACT=0
