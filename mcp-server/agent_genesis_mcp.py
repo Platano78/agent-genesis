@@ -87,9 +87,15 @@ def search_conversations(
         for result in results_list:
             metadata = result.get("metadata", {})
 
-            # Calculate similarity score (1 - distance for better UX)
-            distance = result.get("distance", 1.0)
-            similarity_score = round(1.0 - distance, 3)
+            # Prefer the RRF-fused relevance score (0..1, higher = better) when
+            # present; fall back to the old 1 - distance calc against an
+            # un-upgraded API that hasn't started returning `relevance` yet.
+            relevance = result.get("relevance")
+            if relevance is not None:
+                similarity_score = round(relevance, 3)
+            else:
+                distance = result.get("distance", 1.0)
+                similarity_score = round(1.0 - distance, 3)
 
             document = result.get("document", "")
             preview = metadata.get("user_message_preview", "")

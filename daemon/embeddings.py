@@ -29,7 +29,11 @@ class EmbeddingGenerator:
         if self._model is None:
             logger.info("Loading bge-small-en-v1.5 embedding model...")
             try:
-                self._model = SentenceTransformer('BAAI/bge-small-en-v1.5')
+                # device='cpu' is deliberate: this generator is instantiated by
+                # the indexer but never used (chroma_worker owns real embedding).
+                # Without it sentence-transformers auto-selects CUDA and holds
+                # ~390 MiB of VRAM for nothing.
+                self._model = SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
                 logger.info("✅ Embedding model loaded")
             except Exception as e:
                 logger.error(f"Failed to load embedding model: {e}")

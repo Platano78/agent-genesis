@@ -12,6 +12,13 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Per-block render caps (chars). Tool/thinking content is bracketed and capped
+# so it adds recall without drowning out prose — see docs/indexing-contract.md.
+TOOL_USE_CAP = 1000
+TOOL_RESULT_CAP = 500
+THINKING_CAP = 800
+TRUNCATION_MARKER = "…[truncated]"
+
 
 @dataclass
 class Message:
@@ -24,13 +31,16 @@ class Message:
 @dataclass
 class Conversation:
     """Parsed conversation from Claude history."""
-    id: str  # sessionId
+    id: str  # sessionId (or f"{sessionId}::{agent_file}" for subagent transcripts)
     timestamp: datetime
     messages: List[Message]
     project: Optional[str] = None
     source: Optional[str] = None
     cwd: Optional[str] = None
     git_branch: Optional[str] = None
+    is_sidechain: int = 0  # 1 for nested subagent transcripts, 0 for top-level sessions
+    parent_session_id: Optional[str] = None  # top-level sessionId; equals `id` for top-level
+    agent_file: str = ""  # subagent transcript filename stem, "" for top-level
 
     def message_count(self) -> int:
         """Get total message count."""
@@ -81,6 +91,109 @@ def _decode_project_path(encoded_path: str) -> str:
         return encoded_path
 
 
+def _truncate(text: str, cap: int) -> str:
+    """Truncate text to cap chars, appending TRUNCATION_MARKER when cut."""
+    if len(text) <= cap:
+        return text
+    keep = max(0, cap - len(TRUNCATION_MARKER))
+    return text[:keep] + TRUNCATION_MARKER
+
+
+def _render_input_compact(input_data: Any) -> str:
+    """Render a tool_use input readably: flat dicts as key: value, else JSON."""
+    if not input_data:
+        return ''
+    if isinstance(input_data, dict):
+        is_flat = all(not isinstance(v, (dict, list)) for v in input_data.values())
+        if is_flat:
+            return ", ".join(f"{k}: {v}" for k, v in input_data.items())
+    try:
+        return json.dumps(input_data, default=str, separators=(',', ':'))
+    except Exception:
+        return str(input_data)
+
+
+def _render_ask_user_question(input_data: Any) -> str:
+    """Render AskUserQuestion input so the question + every option survives.
+
+    This is the whole point of Slice A: owner decisions are frequently made
+    by picking from an AskUserQuestion menu, and the rationale (the
+    question + candidate options) previously lived only in a dropped
+    tool_use block.
+    """
+    if not isinstance(input_data, dict):
+        return ''
+    questions = input_data.get('questions') or []
+    lines = []
+    previews = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        lines.append(f"[decision] {q.get('question', '')}")
+        for opt in (q.get('options') or []):
+            if not isinstance(opt, dict):
+                continue
+            label = opt.get('label', '')
+            description = opt.get('description', '')
+            lines.append(f"- {label}: {description}")
+            preview = opt.get('preview')
+            if preview:
+                previews.append(f"  preview: {preview}")
+    if not lines:
+        return ''
+    rendered = "\n".join(lines)
+    # preview is optional context — only include it if it still fits the cap
+    if previews:
+        candidate = rendered + "\n" + "\n".join(previews)
+        if len(candidate) <= TOOL_USE_CAP:
+            rendered = candidate
+    return rendered
+
+
+def _render_tool_use(item: dict) -> str:
+    name = item.get('name', '')
+    if not name:
+        return ''
+    input_data = item.get('input', {})
+    if name == 'AskUserQuestion':
+        rendered = _render_ask_user_question(input_data)
+        if not rendered:
+            return ''
+        return _truncate(rendered, TOOL_USE_CAP)
+    rendered_input = _render_input_compact(input_data)
+    rendered = f"[tool: {name}] {rendered_input}".rstrip() if rendered_input else f"[tool: {name}]"
+    return _truncate(rendered, TOOL_USE_CAP)
+
+
+def _render_tool_result(item: dict) -> str:
+    content = item.get('content', '')
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get('type') == 'text':
+                    parts.append(block.get('text', ''))
+                elif 'text' in block:
+                    parts.append(block.get('text', ''))
+        text = '\n'.join(parts)
+    else:
+        text = str(content) if content else ''
+    text = text.strip()
+    if not text:
+        return ''
+    prefix = '[result:error]' if item.get('is_error') else '[result]'
+    return _truncate(f"{prefix} {text}", TOOL_RESULT_CAP)
+
+
+def _render_thinking(item: dict) -> str:
+    text = (item.get('thinking') or '').strip()
+    if not text:
+        return ''
+    return _truncate(f"[thinking] {text}", THINKING_CAP)
+
+
 def _extract_message_content(json_obj: dict) -> str:
     """
     Extract text content from message data.
@@ -107,14 +220,40 @@ def _extract_message_content(json_obj: dict) -> str:
 
         # Case 2: Content is a list of dicts (Claude format)
         elif isinstance(content, list):
-            text_parts = []
+            # Prose (text blocks) is collected separately from tool/thinking
+            # content and placed first in the rendered output — a deliberate
+            # retrieval-quality choice so that if a chunk later gets
+            # truncated, it's the bracketed tool content that gets cut, not
+            # what the human or assistant actually said. Order is preserved
+            # within each group.
+            prose_parts = []
+            tool_parts = []
             for item in content:
-                if isinstance(item, dict):
-                    if item.get('type') == 'text':
-                        text_parts.append(item.get('text', ''))
-                    elif 'text' in item:
-                        text_parts.append(item.get('text', ''))
-            return '\n'.join(text_parts) if text_parts else ''
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get('type')
+                if item_type == 'text':
+                    text = item.get('text', '')
+                    if text:
+                        prose_parts.append(text)
+                elif item_type == 'tool_use':
+                    rendered = _render_tool_use(item)
+                    if rendered:
+                        tool_parts.append(rendered)
+                elif item_type == 'tool_result':
+                    rendered = _render_tool_result(item)
+                    if rendered:
+                        tool_parts.append(rendered)
+                elif item_type == 'thinking':
+                    rendered = _render_thinking(item)
+                    if rendered:
+                        tool_parts.append(rendered)
+                elif 'text' in item:
+                    text = item.get('text', '')
+                    if text:
+                        prose_parts.append(text)
+            all_parts = prose_parts + tool_parts
+            return '\n'.join(all_parts) if all_parts else ''
 
         return str(content) if content else ''
 
@@ -153,12 +292,19 @@ def _parse_timestamp(timestamp_str: Optional[str]) -> datetime:
     return datetime.now()
 
 
-def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
+def parse_jsonl_file(filepath: Path, project_dir: Optional[Path] = None) -> Optional[Conversation]:
     """
     Parse a single JSONL conversation file.
 
     Args:
         filepath: Path to .jsonl file
+        project_dir: The project-slug directory (direct child of the projects
+            root) that owns this file. Defaults to filepath.parent, which
+            reproduces today's behaviour for top-level session files. Pass
+            the project-slug dir explicitly for nested files (e.g.
+            <project-slug>/<session-id>/subagents/<agent-file>.jsonl) so the
+            project name is decoded from the project dir, not from
+            "subagents".
 
     Returns:
         Parsed Conversation object or None if parsing fails
@@ -170,8 +316,13 @@ def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
         return None
 
     try:
-        # Extract project name from parent directory path
-        encoded_project_path = filepath.parent.name
+        if project_dir is None:
+            project_dir = filepath.parent
+        is_nested = filepath.parent != project_dir
+
+        # Extract project name from the project-slug directory, never from
+        # filepath.parent (which for a nested subagent file is "subagents").
+        encoded_project_path = project_dir.name
         project_name = _decode_project_path(encoded_project_path)
 
         # Read and parse JSONL file
@@ -180,6 +331,7 @@ def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
         cwd = None
         git_branch = None
         first_timestamp = None
+        content_is_sidechain = False
 
         with open(filepath, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
@@ -195,11 +347,16 @@ def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
                     if msg_type not in ('user', 'assistant'):
                         continue
 
-                    # Extract session metadata from first valid message
+                    # Extract session metadata from first valid message.
+                    # Some subagent transcripts sit flat in the project
+                    # directory (no nested subagents/ folder) and carry the
+                    # PARENT session's sessionId — the in-content isSidechain
+                    # flag is the only signal that distinguishes them.
                     if session_id is None:
                         session_id = json_obj.get('sessionId')
                         cwd = json_obj.get('cwd')
                         git_branch = json_obj.get('gitBranch', '')
+                        content_is_sidechain = bool(json_obj.get('isSidechain', False))
 
                     # Extract message content
                     content = _extract_message_content(json_obj)
@@ -231,8 +388,20 @@ def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
             logger.warning(f"No valid messages found in {filepath}")
             return None
 
-        # Use session ID or filename as conversation ID
-        conversation_id = session_id or filepath.stem
+        # Subagent transcripts carry the PARENT session's sessionId, so a plain
+        # session_id-based conversation_id would collide with (and overwrite)
+        # the parent session's chunks. Disambiguate nested files deterministically.
+        is_nested = is_nested or content_is_sidechain
+        if is_nested:
+            parent_session_id = session_id or ""
+            conversation_id = f"{parent_session_id}::{filepath.stem}"
+            agent_file = filepath.stem
+            is_sidechain = 1
+        else:
+            conversation_id = session_id or filepath.stem
+            parent_session_id = conversation_id
+            agent_file = ""
+            is_sidechain = 0
 
         conversation = Conversation(
             id=conversation_id,
@@ -240,7 +409,10 @@ def parse_jsonl_file(filepath: Path) -> Optional[Conversation]:
             messages=messages,
             project=project_name,
             cwd=cwd,
-            git_branch=git_branch
+            git_branch=git_branch,
+            is_sidechain=is_sidechain,
+            parent_session_id=parent_session_id,
+            agent_file=agent_file,
         )
 
         logger.info(f"Successfully parsed conversation {conversation_id} with {len(messages)} messages")
@@ -288,12 +460,13 @@ def scan_projects_directory(
 
         logger.info(f"Scanning project: {project_name} ({project_dir.name})")
 
-        # Find all JSONL files in this project directory
-        jsonl_files = list(project_dir.glob("*.jsonl"))
+        # Find all JSONL files in this project directory, including nested
+        # subagent transcripts under <session-id>/subagents/*.jsonl.
+        jsonl_files = sorted(project_dir.rglob("*.jsonl"))
         logger.info(f"Found {len(jsonl_files)} JSONL files in {project_name}")
 
         for jsonl_file in jsonl_files:
-            conversation = parse_jsonl_file(jsonl_file)
+            conversation = parse_jsonl_file(jsonl_file, project_dir=project_dir)
             if conversation:
                 conversations.append(conversation)
 

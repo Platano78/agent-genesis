@@ -65,8 +65,23 @@ def main() -> None:
         from chromadb.config import Settings
         from chromadb.utils import embedding_functions
 
+        # chromadb's SentenceTransformerEmbeddingFunction defaults device="cpu",
+        # which silently pins embedding to CPU even on a GPU host. Resolve it
+        # explicitly and log it -- that ambiguity cost a full reindex once.
+        embedding_device = os.environ.get("EMBEDDING_DEVICE")
+        if not embedding_device:
+            try:
+                import torch
+
+                embedding_device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                embedding_device = "cpu"
+        logger.info(
+            "Embedding device=%s model=%s", embedding_device, embedding_model
+        )
+
         ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model
+            model_name=embedding_model, device=embedding_device
         )
         client = chromadb.PersistentClient(
             path=persist_dir,
@@ -139,6 +154,11 @@ def _handle_query(params: dict, collections: dict) -> dict:
     query_text = params.get("query_text", "")
     if not query_text.strip():
         raise ValueError("query_text cannot be empty")
+    # Asymmetric retrieval models (arctic-embed, bge, e5) prefix the QUERY only;
+    # passages are embedded bare. ChromaDB applies one embedding function to
+    # both, so the query-side prefix has to be applied here or query and passage
+    # vectors land in different regions of the space.
+    query_text = os.environ.get("EMBEDDING_QUERY_PREFIX", "") + query_text
     n_results = int(params.get("n_results", 10))
     col_names = params.get("collections", ["beta"])
     project_filter = params.get("project_filter")
@@ -202,8 +222,10 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
     chunks = chunk_conversation(conv, conv_meta)
 
     if chunks:
-        # Batch upserts to avoid timeout on large conversations
-        BATCH_SIZE = 20
+        # Batch upserts to avoid timeout on large conversations. 20 starves a
+        # GPU (fits in one sentence-transformers internal batch of 32); larger
+        # batches amortize worker IPC + chroma upsert + SQLite transaction cost.
+        BATCH_SIZE = int(os.environ.get("UPSERT_BATCH_SIZE", "128"))
         for i in range(0, len(chunks), BATCH_SIZE):
             batch = chunks[i:i + BATCH_SIZE]
             documents = [c["document"] for c in batch]

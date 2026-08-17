@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -358,6 +358,112 @@ class ChromaWorkerClient:
 
 
 # ---------------------------------------------------------------------------
+# Result ranking — Reciprocal Rank Fusion
+#
+# FTS results carry `distance = abs(bm25_rank)` where LARGER is better.
+# Vector results carry a cosine `distance` where SMALLER is better. RRF is
+# rank-based, not score-based, so fusing on rank position sidesteps having to
+# calibrate the two incompatible scales.
+# ---------------------------------------------------------------------------
+
+RRF_K = 60
+
+# Equal-weight RRF (1.0/1.0) was measured to regress recall@5 (12/17 -> 11/17 on the
+# committed eval set): the vector arm has no relevance floor and surfaces ~0.67-cosine
+# "matches" for tokens absent from the corpus entirely, and equal weighting promotes
+# that noise to parity with FTS's top results, bumping a real hit out of the top 5.
+# 1.0/0.3 recovers 12/17 while still letting a genuinely strong semantic match surface.
+RRF_WEIGHT_FTS = 1.0
+RRF_WEIGHT_VECTOR = 0.3
+
+
+def _rrf_scores(
+    weighted_ranked_lists: List[Tuple[List[Dict[str, Any]], float]], k: int = RRF_K
+) -> Dict[Any, float]:
+    """Sum weight/(k + rank) contributions per result id across ranked (best-first) lists."""
+    scores: Dict[Any, float] = {}
+    for lst, weight in weighted_ranked_lists:
+        for idx, r in enumerate(lst, start=1):
+            rid = r.get("id")
+            scores[rid] = scores.get(rid, 0.0) + weight / (k + idx)
+    return scores
+
+
+def _dedupe_by_conversation(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep one result per conversation_id — the one with the highest relevance."""
+    seen: Dict[Any, Dict[str, Any]] = {}
+    for r in results:
+        meta = r.get("metadata", r.get("metadatas", {}))
+        if isinstance(meta, list):
+            meta = meta[0] if meta else {}
+        conv_id = meta.get("conversation_id", r.get("id"))
+        if conv_id not in seen or r.get("relevance", 0.0) > seen[conv_id].get("relevance", 0.0):
+            seen[conv_id] = r
+    return list(seen.values())
+
+
+def _normalize_and_sort(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize relevance into 0..1 (by max) and sort descending in place."""
+    max_rel = max((r.get("relevance", 0.0) for r in results), default=0.0)
+    if max_rel > 0:
+        for r in results:
+            r["relevance"] = r["relevance"] / max_rel
+    results.sort(key=lambda r: r.get("relevance", 0.0), reverse=True)
+    return results
+
+
+def merge_ranked_results(
+    fts_results: Optional[List[Dict[str, Any]]] = None,
+    vector_results: Optional[List[Dict[str, Any]]] = None,
+    k: int = RRF_K,
+    fts_weight: float = RRF_WEIGHT_FTS,
+    vector_weight: float = RRF_WEIGHT_VECTOR,
+) -> List[Dict[str, Any]]:
+    """Merge FTS + vector result lists via weighted Reciprocal Rank Fusion.
+
+    Each list is sorted into its own correct best-first order before ranks
+    are assigned (never assumed to already be ordered). Adds a `relevance`
+    float (0..1, higher = better) to every result while leaving the existing
+    `distance` field untouched. Dedupes by conversation_id, keeping the
+    chunk with the highest relevance. Returns the merged list sorted by
+    relevance descending (not truncated — callers slice to n_results).
+
+    Either results argument may be omitted/empty to rank a single source alone.
+
+    The default weights (1.0 FTS / 0.3 vector) were chosen from a recall@5
+    simulation against the committed eval set (see RRF_WEIGHT_VECTOR comment
+    above). That simulation reconstructed the FTS/vector source lists from an
+    already-deduped, truncated hybrid API response, so the ranks fed into it
+    were approximate — the weighting direction is sound but the specific
+    12/17 recall figure is NOT a verified post-change number. Re-measure with
+    docs/eval/run_eval.py against the live API after deploy.
+    """
+    fts_sorted = sorted(fts_results or [], key=lambda r: r.get("distance", 0), reverse=True)
+    vector_sorted = sorted(vector_results or [], key=lambda r: r.get("distance", float("inf")))
+
+    scores = _rrf_scores(
+        [(lst, w) for lst, w in ((fts_sorted, fts_weight), (vector_sorted, vector_weight)) if lst],
+        k=k,
+    )
+
+    by_id: Dict[Any, Dict[str, Any]] = {}
+    for r in fts_sorted:
+        by_id[r["id"]] = r
+    for r in vector_sorted:
+        if r["id"] not in by_id:
+            by_id[r["id"]] = r
+
+    scored = []
+    for rid, r in by_id.items():
+        r = dict(r)
+        r["relevance"] = scores.get(rid, 0.0)
+        scored.append(r)
+
+    deduped = _dedupe_by_conversation(scored)
+    return _normalize_and_sort(deduped)
+
+
+# ---------------------------------------------------------------------------
 # Main Database Class
 # ---------------------------------------------------------------------------
 
@@ -372,7 +478,10 @@ class DualSourceKnowledgeDB:
     def __init__(
         self,
         persist_directory: str = "/app/knowledge",
-        embedding_model_name: str = "all-MiniLM-L6-v2",
+        # Default from the environment so EMBEDDING_MODEL set on the container
+        # actually reaches the worker; _start_worker overwrites env["EMBEDDING_MODEL"]
+        # with this value, so a hardcoded default here silently wins over the env.
+        embedding_model_name: str = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
     ) -> None:
         self.persist_directory = persist_directory
         self.embedding_model_name = embedding_model_name
@@ -434,46 +543,31 @@ class DualSourceKnowledgeDB:
             except Exception as exc:
                 logger.warning("Vector search failed: %s", exc)
 
-        # Merge results
+        # Merge results — every path returns a `relevance`-ranked, sorted list.
         if fts_results and vector_results:
             return self._merge_results(fts_results, vector_results, n_results)
         elif fts_results:
-            return fts_results
+            merged = merge_ranked_results(fts_results=fts_results.get("results", []))
+            return {
+                "results": merged[:n_results],
+                "total_matches": len(merged),
+                "search_type": fts_results.get("search_type", "fts5"),
+            }
         elif vector_results:
-            return vector_results
+            merged = merge_ranked_results(vector_results=vector_results.get("results", []))
+            return {
+                "results": merged[:n_results],
+                "total_matches": len(merged),
+                "search_type": vector_results.get("search_type", "vector"),
+            }
         else:
             raise RuntimeError("All search backends failed")
 
     def _merge_results(
         self, fts: Dict, vector: Dict, n_results: int
     ) -> Dict[str, Any]:
-        """Merge FTS5 and vector search results, deduplicating by conversation."""
-        seen_ids = set()
-        all_results = []
-
-        # FTS results first (more relevant for text search)
-        for r in fts.get("results", []):
-            seen_ids.add(r["id"])
-            all_results.append(r)
-
-        # Add unique vector results (by document ID)
-        for r in vector.get("results", []):
-            if r["id"] not in seen_ids:
-                seen_ids.add(r["id"])
-                all_results.append(r)
-
-        # Deduplicate by conversation_id: keep best-scoring message per conversation
-        seen_convs = {}
-        for r in all_results:
-            meta = r.get("metadata", r.get("metadatas", {}))
-            if isinstance(meta, list):
-                meta = meta[0] if meta else {}
-            conv_id = meta.get("conversation_id", r.get("id"))
-            score = r.get("score", r.get("distance", 0))
-            if conv_id not in seen_convs or score > seen_convs[conv_id].get("score", seen_convs[conv_id].get("distance", 0)):
-                seen_convs[conv_id] = r
-
-        merged = list(seen_convs.values())
+        """Merge FTS5 and vector search results via RRF, deduplicating by conversation."""
+        merged = merge_ranked_results(fts.get("results", []), vector.get("results", []))
 
         return {
             "results": merged[:n_results],

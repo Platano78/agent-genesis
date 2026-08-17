@@ -68,14 +68,20 @@ if [[ -d "$CLAUDE_DOCS_LOCAL" ]]; then
     || log "WARNING: claude-docs rsync failed (non-fatal)"
 fi
 
-# Sync the remaining WSL-sourced QMD collections (memory, skills, agents) to
-# ai-utility. These had no refresh job and froze Mar-Apr 2026; this restores
-# them. Like claude-docs above, reindex is left to Phase 4's 5:30am
-# nightly-synthesis.py (qmd update && qmd embed), so we pass --no-reindex.
+# Sync the remaining WSL-sourced QMD collections (memory, skills, agents,
+# knowledge-base) to ai-utility AND reindex here. These had no refresh job and
+# froze Mar-Apr 2026; the 2026-06-09 fix restored the rsync but delegated the
+# reindex to Phase 4's 5:30am nightly-synthesis.py. That script early-exits
+# ("nothing to synthesize; exiting 0") on days with no new conversation activity
+# — BEFORE its reindex step — so quiet days left these freshly-rsynced collections
+# un-embedded and QMD search stale (observed 2026-06-28/29). Reindexing in this
+# script decouples memory/skills/kb freshness from synthesis activity, so we no
+# longer pass --no-reindex (2026-06-29). nightly-synthesis still reindexes the
+# solutions collection it generates; the extra incremental embed here is cheap.
 QMD_KNOWLEDGE_SYNC="${QMD_KNOWLEDGE_SYNC:-$HOME/.claude/scripts/qmd-knowledge-sync.sh}"
 if [[ -x "$QMD_KNOWLEDGE_SYNC" ]]; then
-  log "Syncing QMD memory/skills/agents collections (--no-reindex)"
-  QMD_REMOTE="$REMOTE_HOST" "$QMD_KNOWLEDGE_SYNC" --no-reindex 2>&1 | tee -a "$LOG_FILE" \
+  log "Syncing QMD memory/skills/agents/knowledge-base collections (with reindex)"
+  QMD_REMOTE="$REMOTE_HOST" "$QMD_KNOWLEDGE_SYNC" 2>&1 | tee -a "$LOG_FILE" \
     || log "WARNING: qmd-knowledge-sync failed (non-fatal)"
 fi
 

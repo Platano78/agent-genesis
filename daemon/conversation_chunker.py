@@ -14,6 +14,41 @@ from typing import List, Tuple
 MAX_CHUNK_CHARS = 920
 MAX_FULL_TEXT_CHARS = 10_000
 MAX_PREVIEW_CHARS = 500
+MAX_TURN_PARTS = 6  # bound the split-instead-of-truncate explosion per turn
+TRUNCATION_MARKER = "…[truncated]"
+
+
+def _split_turn_doc(full_doc: str, turn_idx: int, user_text: str) -> List[str]:
+    """Split an oversized turn document into <= MAX_TURN_PARTS chunk-sized parts.
+
+    Each part repeats a short context header (turn index + a topic snippet
+    from the user's message) so a fragment retrieved on its own still means
+    something — see the v1.3.0 design note on contextless fragments.
+    """
+    topic = user_text.strip().replace("\n", " ")[:80]
+    if len(user_text.strip()) > 80:
+        topic += "…"
+    header = f"[Turn {turn_idx} continued — topic: {topic}]\n"
+    budget = MAX_CHUNK_CHARS - len(header)
+    if budget <= 0:
+        header = ""
+        budget = MAX_CHUNK_CHARS
+
+    parts = []
+    pos = 0
+    doc_len = len(full_doc)
+    while pos < doc_len and len(parts) < MAX_TURN_PARTS:
+        parts.append(header + full_doc[pos:pos + budget])
+        pos += budget
+
+    if pos < doc_len:
+        # More content remains beyond the part cap — mark the last emitted
+        # part as truncated rather than silently dropping the marker.
+        available = MAX_CHUNK_CHARS - len(TRUNCATION_MARKER)
+        last = parts[-1][:available] if len(parts[-1]) > available else parts[-1]
+        parts[-1] = last + TRUNCATION_MARKER
+
+    return parts
 
 
 def _group_turn_pairs(messages: list) -> List[Tuple[str, str]]:
@@ -103,6 +138,10 @@ def chunk_conversation(conv: dict, conv_meta: dict) -> List[dict]:
     if not first_user_content:
         first_user_content = filtered[0].get("content", "")
 
+    # is_sidechain/parent_session_id/agent_file live on the Conversation
+    # dataclass itself (conv), not conv_meta — conv_meta is assembled
+    # upstream in chroma_worker.py from a fixed key whitelist that doesn't
+    # include them, so pulling from conv keeps chroma_worker.py untouched.
     base_meta = {
         "conversation_id": conversation_id,
         "conversation_timestamp": ts_str,
@@ -111,6 +150,9 @@ def chunk_conversation(conv: dict, conv_meta: dict) -> List[dict]:
         "cwd": conv_meta.get("cwd", ""),
         "git_branch": conv_meta.get("git_branch", ""),
         "message_count": len(filtered),
+        "is_sidechain": int(conv.get("is_sidechain") or 0),
+        "parent_session_id": conv.get("parent_session_id") or conversation_id,
+        "agent_file": conv.get("agent_file") or "",
     }
 
     # --- Anchor chunk ---
@@ -141,28 +183,35 @@ def chunk_conversation(conv: dict, conv_meta: dict) -> List[dict]:
     # --- Turn-pair chunks ---
     turn_pairs = _group_turn_pairs(filtered)
     for turn_idx, (user_text, assistant_text) in enumerate(turn_pairs):
-        turn_doc = f"User: {user_text}\nAssistant: {assistant_text}"
-        if len(turn_doc) > MAX_CHUNK_CHARS:
-            user_budget = min(len(user_text) + 6, MAX_CHUNK_CHARS // 2)
-            assistant_budget = MAX_CHUNK_CHARS - user_budget
-            turn_doc = (
-                f"User: {user_text[:user_budget - 6]}\n"
-                f"Assistant: {assistant_text[:assistant_budget - 12]}"
-            )
+        full_turn_doc = f"User: {user_text}\nAssistant: {assistant_text}"
+        if len(full_turn_doc) <= MAX_CHUNK_CHARS:
+            turn_doc_parts = [full_turn_doc]
+        else:
+            # Split rather than truncate: truncation would silently evict
+            # whichever content lands past the cap (tool output ballooned
+            # by Slice A) instead of losing only the declared overflow.
+            turn_doc_parts = _split_turn_doc(full_turn_doc, turn_idx, user_text)
 
-        turn_id = hashlib.sha256(
-            f"{conversation_id}:turn:{turn_idx}".encode()
-        ).hexdigest()[:36]
+        for part_idx, turn_doc in enumerate(turn_doc_parts):
+            if part_idx == 0:
+                turn_id = hashlib.sha256(
+                    f"{conversation_id}:turn:{turn_idx}".encode()
+                ).hexdigest()[:36]
+            else:
+                turn_id = hashlib.sha256(
+                    f"{conversation_id}:turn:{turn_idx}:{part_idx}".encode()
+                ).hexdigest()[:36]
 
-        turn_meta = dict(base_meta)
-        turn_meta["chunk_type"] = "turn"
-        turn_meta["chunk_index"] = turn_idx + 1
-        turn_meta["turn_index"] = turn_idx
+            turn_meta = dict(base_meta)
+            turn_meta["chunk_type"] = "turn"
+            turn_meta["chunk_index"] = turn_idx + 1
+            turn_meta["turn_index"] = turn_idx
+            turn_meta["part_index"] = part_idx
 
-        chunks.append({
-            "doc_id": turn_id,
-            "document": turn_doc,
-            "metadata": turn_meta,
-        })
+            chunks.append({
+                "doc_id": turn_id,
+                "document": turn_doc,
+                "metadata": turn_meta,
+            })
 
     return chunks

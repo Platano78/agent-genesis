@@ -261,27 +261,42 @@ class ConversationIndexer:
                 logger.error(f"Projects directory not found: {projects_dir}")
                 return 0
 
-            # Collect JSONL files that are new or modified since last indexing
+            # Collect JSONL files that are new or modified since last indexing,
+            # including nested subagent transcripts under
+            # <session-id>/subagents/*.jsonl.
             files_to_parse = []
+            skipped_unreadable = 0
             for project_dir in sorted(projects_path.iterdir()):
                 if not project_dir.is_dir():
                     continue
-                for jsonl_file in project_dir.glob("*.jsonl"):
+                for jsonl_file in sorted(project_dir.rglob("*.jsonl")):
+                    try:
+                        if not jsonl_file.is_file():
+                            skipped_unreadable += 1
+                            logger.warning("Skipping unreadable/dangling path: %s", jsonl_file)
+                            continue
+                        file_mtime = jsonl_file.stat().st_mtime
+                    except OSError as e:
+                        skipped_unreadable += 1
+                        logger.warning("Skipping unstattable path %s: %s", jsonl_file, e)
+                        continue
                     file_key = str(jsonl_file)
-                    file_mtime = jsonl_file.stat().st_mtime
                     if file_key in manifest and manifest[file_key] >= file_mtime:
                         continue  # Unchanged since last indexing
-                    files_to_parse.append((jsonl_file, file_mtime))
+                    files_to_parse.append((jsonl_file, file_mtime, project_dir))
 
-            logger.info(f"Found {len(files_to_parse)} new/modified JSONL files (skipped {len(manifest)} unchanged)")
+            logger.info(
+                f"Found {len(files_to_parse)} new/modified JSONL files "
+                f"(skipped {len(manifest)} unchanged, {skipped_unreadable} unreadable)"
+            )
 
             if not files_to_parse:
                 return 0
 
             indexed = 0
-            for jsonl_file, file_mtime in files_to_parse:
+            for jsonl_file, file_mtime, project_dir in files_to_parse:
                 try:
-                    conversation = parse_jsonl_file(jsonl_file)
+                    conversation = parse_jsonl_file(jsonl_file, project_dir=project_dir)
                     if conversation:
                         self._index_conversation(conversation, collection="alpha")
                         indexed += 1
@@ -294,7 +309,7 @@ class ConversationIndexer:
             return indexed
         except Exception as e:
             logger.error(f"JSONL indexing failed: {e}")
-            return 0
+            raise
 
     def index_memory_files(self, projects_dir: str) -> int:
         """Index Claude Code memory markdown files, skipping unchanged."""
@@ -324,7 +339,7 @@ class ConversationIndexer:
             return indexed
         except Exception as exc:
             logger.error("Memory file indexing failed: %s", exc)
-            return 0
+            raise
 
     def index_all_sources(
         self,

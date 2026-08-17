@@ -39,7 +39,8 @@ def _run_indexing_job(job_id: str, enable_mkg: bool) -> None:
         with _indexing_lock:
             _current_job = {"job_id": job_id, "status": "complete", "stats": {
                 "alpha_indexed": stats["alpha_indexed"], "beta_indexed": stats["beta_indexed"],
-                "total_indexed": stats["total_indexed"], "duration_seconds": stats["duration"]}}
+                "total_indexed": stats["total_indexed"], "duration_seconds": stats["duration"],
+                "errors": stats["errors"]}}
     except Exception as exc:
         logger.error("Background indexing failed: %s", exc)
         with _indexing_lock:
