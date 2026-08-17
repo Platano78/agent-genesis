@@ -496,6 +496,19 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Changelog
 
+### v1.6.0 (2026-08-17)
+- Index nested subagent transcripts — enumeration was non-recursive, so files below the
+  session level were never opened
+- Index `tool_use`, `tool_result` and `thinking` blocks; previously only `text` blocks
+  became searchable, so tool-driven decisions were invisible to search
+- Fix two silent failures: an unreadable path aborted the whole indexing pass and was
+  reported as success, and `EMBEDDING_MODEL` was overwritten before reaching the worker
+- Add `EMBEDDING_DEVICE`, `EMBEDDING_QUERY_PREFIX` and `UPSERT_BATCH_SIZE`
+- Weighted RRF fusion; equal weights measurably regressed recall
+
+<!-- NOTE: v1.4.0, v1.4.1 and v1.5.0 shipped as GitHub releases but were never added
+     to this section. See the releases page for their notes. -->
+
 ### v1.3.0 (2026-04-08)
 - MCP server updated to align package and runtime version metadata at `1.3.0`
 - Added MCP resources and prompts for MCP 2025-11-25 compliance

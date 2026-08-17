@@ -4,7 +4,7 @@
 
 This package provides an MCP (Model Context Protocol) server that enables Claude Code to search through your conversation history using the Agent Genesis API.
 
-Current package version: `1.3.0`
+Current package version: `1.6.0`
 
 ## Prerequisites
 
