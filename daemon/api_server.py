@@ -48,7 +48,7 @@ def _run_indexing_job(job_id: str, enable_mkg: bool) -> None:
 
 
 def _build_endpoints_list() -> list:
-    return ["/search", "/index/trigger", "/index/status", "/stats", "/live", "/ready", "/health", "/health/deep"]
+    return ["/search", "/index/trigger", "/index/status", "/stats", "/live", "/ready", "/health", "/health/deep", "/health/vector"]
 
 
 def _collect_disk_stats(persist_dir: str) -> tuple:
@@ -149,6 +149,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_health()
         elif path == '/health/deep':
             self.handle_health_deep()
+        elif path == '/health/vector':
+            self.handle_health_vector()
         elif path == '/stats':
             self.handle_stats()
         elif path == '/index/status':
@@ -283,6 +285,47 @@ class APIHandler(BaseHTTPRequestHandler):
         result = _run_deep_check(self.db)
         status_code = 503 if result.get("status") == "UNHEALTHY" else 200
         self.send_json_response(result, status=status_code)
+
+    def handle_health_vector(self):
+        """Vector-search health, dedicated from /health (liveness) so a monitor can
+        alert on vector death without the container healthcheck restarting mid-index."""
+        if self.db is None:
+            self.send_json_response(
+                {"vector_available": False, "collections": {}, "last_error": "Database is not initialized"},
+                status=503,
+            )
+            return
+
+        try:
+            available = self.db._worker.is_available
+            breaker = self.db._worker.breaker_status()
+            collections = {}
+            last_error = breaker.get("last_error")
+            if available:
+                try:
+                    _col_stats = self.db.get_collection_stats()
+                    collections = {
+                        "alpha": _col_stats.get("alpha", {}).get("count", 0),
+                        "beta": _col_stats.get("beta", {}).get("count", 0),
+                    }
+                except Exception as e:
+                    last_error = str(e)[:200]
+
+            self.send_json_response(
+                {
+                    "vector_available": available,
+                    "collections": collections,
+                    "last_error": last_error,
+                    "breaker": breaker,
+                },
+                status=200 if available else 503,
+            )
+        except Exception as e:
+            logger.error("Vector health check failed: %s", e)
+            self.send_json_response(
+                {"vector_available": False, "collections": {}, "last_error": str(e)[:200]},
+                status=503,
+            )
 
     def handle_stats(self):
         """Handle collection statistics request (live counts + indexing status)."""

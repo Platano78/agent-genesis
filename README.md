@@ -496,6 +496,28 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Changelog
 
+### v1.7.0 (2026-08-17)
+- Redesign the ChromaDB worker circuit breaker. A long-running index batch could blow the
+  RPC deadline and latch vector search off **permanently** — searches silently degraded to
+  keyword-only behind an HTTP 200 and a healthy container. Replaced with a locked state
+  machine (`CLOSED → OPEN → RECOVERING → CLOSED`) and a single permanent supervisor, so a
+  degraded vector arm always has recovery scheduled
+- Classify worker errors at the raise site: a malformed query (empty text, bad collection)
+  no longer opens a backend-health breaker for everyone
+- Bound every wait. `_start_worker` used a blocking `readline()` whose deadline was only
+  checked *between* reads, so a worker that never signalled ready wedged the supervisor
+  indefinitely and `READY_TIMEOUT` had no effect
+- Never restart the worker on the request path; only the supervisor owns process lifecycle,
+  and query admission fails fast rather than waiting out a recovery probe
+- Stamp collections with an embedding-model manifest, and refuse to serve on mismatch.
+  Two same-dimension indexes built by different models previously loaded without error and
+  returned confidently-ranked noise. `scripts/stamp_manifest.py` migrates existing indexes
+- Add `GET /health/vector` reporting breaker state, epoch, generation, consecutive failures
+  and `state_age_s`, so a monitor can alert on vector death without restarting mid-index
+- New env vars: `RPC_TIMEOUT_QUERY` / `RPC_TIMEOUT_INDEX` / `RPC_TIMEOUT_PING`,
+  `VECTOR_QUERY_LOCK_TIMEOUT`, `VECTOR_LIVENESS_POLL_S`, `VECTOR_PROBE_REQUIRED_COLLECTIONS`
+- 55 worker-protocol tests, up from 34
+
 ### v1.6.0 (2026-08-17)
 - Index nested subagent transcripts — enumeration was non-recursive, so files below the
   session level were never opened

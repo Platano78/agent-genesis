@@ -222,30 +222,145 @@ class FTSSearchEngine:
 # ChromaDB Worker Client — secondary search path for vector/semantic search
 # ---------------------------------------------------------------------------
 
+class WorkerRequestError(Exception):
+    """A malformed/invalid client request (bad params, unknown method).
+
+    Never touches breaker state — a bad query from one caller must not
+    degrade vector search for everyone (defect 3 in a94ad08).
+    """
+
+
+class WorkerBackendError(Exception):
+    """The worker/backend itself failed (crash, timeout, EOF, exception).
+
+    Always a circuit-breaker-relevant failure.
+    """
+
+
+class _SupervisorStop(Exception):
+    """Internal sentinel: `_supervise_once()` raises this on STOPPED so the
+    F3 blanket except in `_supervise()` cannot mistake a clean shutdown for
+    a fault to log-and-continue past."""
+
+
 class ChromaWorkerClient:
     """Manages a ChromaDB worker subprocess for vector search.
 
     All ChromaDB operations run in a dedicated subprocess. If it segfaults
     due to chromadb_rust_bindings, only the worker dies — the API server
     stays up and falls back to FTS search.
+
+    Circuit breaker: a locked state machine (CLOSED -> OPEN -> RECOVERING ->
+    CLOSED, plus terminal STOPPED) owned entirely by one permanent
+    Event-driven supervisor thread started in __init__. The request path
+    (call()) only ever reads state and records failures; it never starts,
+    restarts, or terminates the worker process, and recovery success is
+    published via an epoch compare-and-set so a failure that lands mid-probe
+    can never be silently overwritten by a stale success (see docs/plans/
+    worker-breaker-redesign.md, rulings R1-R10).
     """
 
     _READY_TIMEOUT = 60
-    _RPC_TIMEOUT = 120
+    # One timeout for all three RPC methods was wrong: `index` batches can
+    # legitimately run long, while `query`/`ping` hanging that long means
+    # something is actually stuck. Per-method, env-overridable.
+    _RPC_TIMEOUT_QUERY = int(os.environ.get("RPC_TIMEOUT_QUERY", "20"))
+    _RPC_TIMEOUT_INDEX = int(os.environ.get("RPC_TIMEOUT_INDEX", "120"))
+    _RPC_TIMEOUT_PING = int(os.environ.get("RPC_TIMEOUT_PING", "10"))
+
+    # R6: how long a query will wait to acquire the RPC pipe lock before
+    # degrading to fts5. Sits well above a normal ~250ms query and far below
+    # the ~25s probe, so a request can never wait out a probe.
+    _QUERY_LOCK_TIMEOUT = float(os.environ.get("VECTOR_QUERY_LOCK_TIMEOUT", "3.0"))
+
+    # F2: the CLOSED park must be bounded -- a dead worker process must self-
+    # heal even if nothing ever explicitly recorded the failure that killed
+    # it. Cost is one poll() every 30s, which is free.
+    _LIVENESS_POLL_S = float(os.environ.get("VECTOR_LIVENESS_POLL_S", "30"))
+
+    # R1 breaker states.
+    _CLOSED = "CLOSED"
+    _OPEN = "OPEN"
+    _RECOVERING = "RECOVERING"
+    _STOPPED = "STOPPED"
+
+    _BACKOFF_SCHEDULE = (120, 300, 900, 1800)   # 2min, 5min, 15min, 30min
+    _HEALTHY_RESET_AFTER = 600                  # 10min clean before backoff resets
+
+    # R7: alpha holds 676,736 of 677,828 docs. Requiring both would let a
+    # beta-only manifest mismatch drop the entire corpus to keyword-only.
+    _PROBE_REQUIRED_COLLECTIONS = frozenset(
+        c.strip() for c in
+        os.environ.get("VECTOR_PROBE_REQUIRED_COLLECTIONS", "alpha").split(",")
+        if c.strip()
+    )
 
     def __init__(self, persist_directory: str, embedding_model_name: str) -> None:
         self.persist_directory = persist_directory
         self.embedding_model_name = embedding_model_name
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # guards the stdin/stdout pipe -- outer lock
+        self._state_lock = threading.Lock()    # guards breaker state -- always innermost,
+                                                 # never held across an RPC or a _wake.wait()
         self._process: Optional[subprocess.Popen] = None
-        self._available = False
+        # Bumped every time a worker subprocess is (re)started. Tags requests
+        # so a late reply from a worker generation we've already abandoned
+        # (e.g. after a timeout-triggered restart) is recognized as stale.
+        self._generation = 0
+
+        # Breaker state -- all under _state_lock.
+        self._epoch = 0                          # bumped on every transition into OPEN
+        self._consecutive_failures = 0           # failed recovery probes; drives backoff
+        self._closed_since: Optional[float] = None
+        self._state_since: float = time.monotonic()  # G2: monitor signal for a wedged state
+        self._last_error: Optional[str] = None
+        self._last_index_error: Optional[str] = None
+        self._served_collections: List[str] = []
+
+        self._wake = threading.Event()
+
+        # B4: a successful start does not prove the HNSW index can answer --
+        # only a probe does. RECOVERING withholds CLOSED until the
+        # supervisor's first (immediate, failures=0) probe passes. A failed
+        # start skips straight to OPEN and lets that same supervisor own
+        # retry/backoff -- R5: __init__ never restarts on its own.
         try:
             self._start_worker()
-            self._available = True
+            self._set_state(self._RECOVERING)
         except Exception as exc:
+            self._last_error = str(exc)
             logger.warning("ChromaDB worker failed to start: %s — vector search disabled", exc)
+            self._set_state(self._OPEN)
+
+        # R2: exactly one permanent supervisor for the object's life. Never
+        # _ensure_supervisor(), never a one-shot thread.
+        self._supervisor = threading.Thread(
+            target=self._supervise, name="chroma-worker-supervisor", daemon=True
+        )
+        self._supervisor.start()
+
+    def _timeout_for(self, method: str) -> int:
+        return {
+            "query": self._RPC_TIMEOUT_QUERY,
+            "index": self._RPC_TIMEOUT_INDEX,
+            "ping": self._RPC_TIMEOUT_PING,
+        }.get(method, self._RPC_TIMEOUT_QUERY)
 
     def _start_worker(self) -> None:
+        """Spawn the worker and block until it signals ready.
+
+        G1: `readline()` is an unbounded blocking read -- a SIGSTOPped worker,
+        or one wedged mmapping a multi-GB HNSW index, never writes a line and
+        never exits, so the old `while time.monotonic() < deadline:` guard
+        (only checked *between* reads) never got back to firing. That left
+        the supervisor parked inside this call forever, holding `_lock`, with
+        state stuck RECOVERING -- the same "stranded with nothing watching"
+        invariant violation as F1/F2, just reachable from a different state.
+        Bounding the wait with `select` (mirroring `_rpc`) and terminating a
+        worker that times out closes it.
+        """
+        import select
+
+        self._generation += 1
         env = os.environ.copy()
         env["CHROMA_PERSIST_DIR"] = self.persist_directory
         env["EMBEDDING_MODEL"] = self.embedding_model_name
@@ -262,14 +377,28 @@ class ChromaWorkerClient:
         )
 
         deadline = time.monotonic() + self._READY_TIMEOUT
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate()
+                raise WorkerBackendError(
+                    f"ChromaDB worker did not become ready within {self._READY_TIMEOUT}s"
+                )
             if self._process.poll() is not None:
-                raise RuntimeError(
+                raise WorkerBackendError(
                     f"ChromaDB worker exited during startup (rc={self._process.returncode})"
                 )
+
+            ready, _, _ = select.select([self._process.stdout], [], [], remaining)
+            if not ready:
+                self._terminate()
+                raise WorkerBackendError(
+                    f"ChromaDB worker did not become ready within {self._READY_TIMEOUT}s"
+                )
+
             line = self._process.stdout.readline()
             if not line:
-                raise RuntimeError("ChromaDB worker closed stdout before signalling ready")
+                raise WorkerBackendError("ChromaDB worker closed stdout before signalling ready")
             try:
                 msg = json.loads(line)
                 if msg.get("result") == "ready":
@@ -277,8 +406,6 @@ class ChromaWorkerClient:
                     return
             except json.JSONDecodeError:
                 pass
-
-        raise RuntimeError(f"ChromaDB worker did not become ready within {self._READY_TIMEOUT}s")
 
     def _is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
@@ -301,60 +428,360 @@ class ChromaWorkerClient:
             self._process = None
 
     def _rpc(self, method: str, params: dict) -> Any:
+        """Send one request and block for its matching response.
+
+        Caller must hold `_lock`. Raises WorkerRequestError for a malformed
+        client request (never breaker-relevant) and WorkerBackendError for
+        every other failure mode -- timeout, EOF, malformed JSON, or a worker
+        exception with error_kind != "request" (missing error_kind maps to
+        backend too: fail-safe, matches pre-redesign behaviour).
+        """
         import select
 
+        if self._process is None:
+            raise WorkerBackendError("Worker process is not running")
+
         req_id = str(uuid.uuid4())
+        gen = self._generation
         self._process.stdin.write(
-            json.dumps({"id": req_id, "method": method, "params": params}) + "\n"
+            json.dumps({"id": req_id, "method": method, "params": params, "gen": gen}) + "\n"
         )
         self._process.stdin.flush()
 
-        ready, _, _ = select.select([self._process.stdout], [], [], self._RPC_TIMEOUT)
-        if not ready:
-            raise RuntimeError(f"Worker RPC timeout after {self._RPC_TIMEOUT}s")
+        timeout = self._timeout_for(method)
+        deadline = time.monotonic() + timeout
 
-        line = self._process.stdout.readline()
-        if not line:
-            raise RuntimeError("Worker process died (stdout EOF)")
+        # Read responses until one matches this request's id AND generation,
+        # discarding stragglers (e.g. a late reply from a previous timeout)
+        # instead of returning them or letting them desync the stream.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkerBackendError(f"Worker RPC timeout after {timeout}s")
 
-        resp = json.loads(line)
-        if "error" in resp:
-            raise RuntimeError(f"Worker error: {resp['error']}")
-        return resp["result"]
+            ready, _, _ = select.select([self._process.stdout], [], [], remaining)
+            if not ready:
+                raise WorkerBackendError(f"Worker RPC timeout after {timeout}s")
+
+            line = self._process.stdout.readline()
+            if not line:
+                raise WorkerBackendError("Worker process died (stdout EOF)")
+
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise WorkerBackendError(f"Malformed worker response: {exc}") from exc
+
+            if resp.get("id") != req_id or resp.get("gen") != gen:
+                logger.warning(
+                    "Discarding stale worker response (id=%s gen=%s, expected id=%s gen=%s)",
+                    resp.get("id"), resp.get("gen"), req_id, gen,
+                )
+                continue
+
+            if "error" in resp:
+                if resp.get("error_kind") == "request":
+                    raise WorkerRequestError(resp["error"])
+                raise WorkerBackendError(resp["error"])
+            return resp["result"]
 
     @property
     def is_available(self) -> bool:
-        return self._available and self._is_alive()
+        # Reflects the breaker, not just liveness: a live worker whose queries
+        # are failing is NOT available for serving, and /health/vector must say so.
+        with self._state_lock:
+            state = self._state
+        return state == self._CLOSED and self._is_alive()
 
-    def call(self, method: str, params: dict) -> Any:
-        if not self._available:
+    def _set_state(self, new_state: str) -> None:
+        """Caller must already hold `_state_lock` (or, in __init__, be before
+        the object is published to the supervisor thread). G2: stamps every
+        transition so `breaker_status()` can expose `state_age_s` -- the
+        monitor signal for "stuck RECOVERING/OPEN with nothing happening",
+        the exact shape of the wedged-`_start_worker` bug this fixes."""
+        self._state = new_state
+        self._state_since = time.monotonic()
+
+    # --- circuit breaker -------------------------------------------------
+    #
+    # 2026-08-17: a nightly INDEX batch blew the RPC deadline, and the old code
+    # responded by latching `_available = False` forever. Hybrid search served
+    # keyword-only for 5 hours behind an HTTP 200. This redesign's invariant:
+    # the system can never reach a state where serving is off and nothing is
+    # scheduled to turn it back on (R1-R3). Two rules survive from the original
+    # fix:
+    #
+    #   1. An INDEX failure must never disable QUERYING. Conflating them was
+    #      the actual bug -- a slow batch write killed reading.
+    #   2. A request must never pay for recovery. Degrade now, heal in the
+    #      background -- never restart or block on the request path (R5, R6).
+
+    def _backoff_base_delay(self, failures: int) -> float:
+        if failures <= 0:
+            return 0
+        # failures=1 -> first backoff rung (120s), not the second
+        return self._BACKOFF_SCHEDULE[min(failures - 1, len(self._BACKOFF_SCHEDULE) - 1)]
+
+    def _backoff_delay(self, failures: int) -> float:
+        base = self._backoff_base_delay(failures)
+        if base == 0:
+            return 0
+        # jitter so repeated failures don't synchronise into a thundering herd
+        return base * (0.8 + 0.4 * (uuid.uuid4().int % 1000) / 1000.0)
+
+    def _record_backend_failure(self, exc: Exception) -> None:
+        """A backend-health failure: transition into OPEN and wake the supervisor.
+
+        Never called for WorkerRequestError, and never called for index
+        failures (see _call_index) -- both are deliberate exclusions, not
+        oversights.
+        """
+        with self._state_lock:
+            if self._state == self._STOPPED:
+                return
+            self._last_error = str(exc)
+            # R10: fold the 600s clean-streak reset into the transition itself
+            # -- single read of closed_since, under the same lock, instead of
+            # a free-floating optional float read twice on the request path.
+            if (self._state == self._CLOSED and self._closed_since is not None
+                    and time.monotonic() - self._closed_since > self._HEALTHY_RESET_AFTER):
+                self._consecutive_failures = 0
+            self._epoch += 1
+            self._set_state(self._OPEN)
+            self._closed_since = None
+        # Wakes a supervisor parked in CLOSED's indefinite wait, or one
+        # already backing off in OPEN (harmless no-op there).
+        self._wake.set()
+
+    def _supervise(self) -> None:
+        """The one permanent recovery loop. Owns all process lifecycle calls.
+
+        F3: the loop body is wrapped in try/except -- this is the ONLY
+        supervisor, and an unhandled exception anywhere inside it would end
+        recovery permanently and silently, which is the exact invariant this
+        redesign exists to guarantee. STOPPED still returns cleanly: a
+        `return` is not an exception, so it is unaffected by the except.
+        """
+        while True:
+            try:
+                self._supervise_once()
+            except _SupervisorStop:
+                return
+            except Exception:
+                logger.exception("Unexpected error in worker supervisor loop -- continuing")
+                time.sleep(1)  # avoid a busy-loop if the fault is persistent
+
+    def _supervise_once(self) -> None:
+        with self._state_lock:
+            state = self._state
+        if state == self._STOPPED:
+            raise _SupervisorStop()
+
+        if state == self._CLOSED:
+            # Clear before check, not after: the reverse order is the lost
+            # wakeup this whole redesign exists to kill. A failure landing
+            # between an "after" clear and the wait would be swallowed.
+            self._wake.clear()
+            with self._state_lock:
+                state = self._state
+            if state == self._CLOSED:
+                # F2: bounded park. A dead worker process must self-heal even
+                # if nothing ever explicitly recorded the failure that killed
+                # it (e.g. discovered only via a since-fixed index code path).
+                self._wake.wait(timeout=self._LIVENESS_POLL_S)
+                with self._state_lock:
+                    still_closed = self._state == self._CLOSED
+                if still_closed and not self._is_alive():
+                    self._record_backend_failure(WorkerBackendError("worker process is not alive"))
+            return
+
+        # OPEN or RECOVERING (recovering only transiently at startup):
+        # wait out backoff, or wake immediately on shutdown.
+        with self._state_lock:
+            failures = self._consecutive_failures
+        delay = self._backoff_delay(failures)
+        if delay:
+            logger.info("Vector recovery backing off %.0fs (failure #%d)", delay, failures)
+            self._wake.clear()
+            self._wake.wait(timeout=delay)
+
+        with self._state_lock:
+            if self._state == self._STOPPED:
+                raise _SupervisorStop()
+            self._set_state(self._RECOVERING)
+            epoch_snapshot = self._epoch
+
+        success = self._probe()
+
+        with self._state_lock:
+            if self._state == self._STOPPED:
+                raise _SupervisorStop()
+            # R3: publish success only via compare-and-set. A failure
+            # recorded during the probe bumped _epoch; the CAS fails, the
+            # stale success is discarded, and we stay OPEN and loop again.
+            if success and self._epoch == epoch_snapshot:
+                self._set_state(self._CLOSED)
+                self._consecutive_failures = 0
+                self._closed_since = time.monotonic()
+                logger.info("Vector search recovered")
+            else:
+                if success:
+                    logger.warning(
+                        "Probe succeeded but a failure landed during it "
+                        "(epoch %d -> %d) -- discarding, staying OPEN",
+                        epoch_snapshot, self._epoch,
+                    )
+                else:
+                    self._consecutive_failures += 1
+                self._set_state(self._OPEN)
+
+    def _probe(self) -> bool:
+        """Half-open probe: restart, ping, then a REAL query with a per-collection
+        sentinel (R7, defect 6).
+
+        A ping only proves the stdin loop is alive. It does NOT prove the HNSW
+        index can answer -- and neither does a query that merely didn't raise:
+        the worker silently skips collections it failed to load, so a
+        zero-hit-but-successful response can hide a dead alpha. The probe
+        instead asserts every required collection actually appears in
+        `served_collections`.
+        """
+        try:
+            with self._lock:
+                self._terminate()
+                self._start_worker()
+                self._rpc("ping", {})
+                result = self._rpc("query", {
+                    "query_text": "canary", "n_results": 1,
+                    "collections": ["alpha", "beta"],
+                })
+            served = set((result or {}).get("served_collections") or [])
+            with self._state_lock:
+                self._served_collections = sorted(served)
+            missing = self._PROBE_REQUIRED_COLLECTIONS - served
+            if missing:
+                raise WorkerBackendError(f"Probe missing required collection(s): {sorted(missing)}")
+            return True
+        except Exception as exc:
+            with self._state_lock:
+                self._last_error = str(exc)
+            logger.warning("Vector recovery probe failed: %s", exc)
+            return False
+
+    def _call_query(self, method: str, params: dict) -> Any:
+        """R6: bounded-wait admission. `_lock` guards the whole RPC, so a
+        non-blocking acquire would drop every concurrent query the moment two
+        requests overlap -- worse than the bug being fixed. Instead: admit
+        only when CLOSED, wait briefly (default 3s, well under the ~25s
+        probe) for the pipe, then re-check nothing moved while queued.
+        """
+        with self._state_lock:
+            if self._state != self._CLOSED:
+                return None
+            epoch_snapshot = self._epoch
+            gen_snapshot = self._generation
+
+        if not self._lock.acquire(timeout=self._QUERY_LOCK_TIMEOUT):
+            logger.warning(
+                "Vector query admission timed out after %.1fs waiting for the worker "
+                "lock -- degrading to fts5 for this request", self._QUERY_LOCK_TIMEOUT,
+            )
             return None
+        try:
+            with self._state_lock:
+                if (self._state != self._CLOSED
+                        or self._epoch != epoch_snapshot
+                        or self._generation != gen_snapshot):
+                    return None  # the world moved while we queued for the lock
+            try:
+                result = self._rpc(method, params)
+            except WorkerRequestError as exc:
+                logger.warning("Worker request error (%s): %s -- not a backend failure", method, exc)
+                return None
+            except Exception as exc:
+                logger.error("Worker query call failed (%s) — degrading to keyword-only, "
+                             "recovering in background", exc)
+                self._record_backend_failure(exc)
+                return None
+        finally:
+            self._lock.release()
+
+        if isinstance(result, dict) and result.get("served_collections") is not None:
+            with self._state_lock:
+                self._served_collections = list(result["served_collections"])
+        return result
+
+    def _call_index(self, params: dict) -> Any:
+        """Indexing keeps a blocking acquire -- an index job has no latency
+        contract -- and a slow-but-live index batch must never disable
+        querying: that conflation was the actual 2026-08-17 incident. So a
+        timeout/error against a STILL-ALIVE worker only ever touches
+        `_last_index_error`, never breaker state.
+
+        But a worker process that is dead -- whether found dead on entry, or
+        found dead right after an RPC blew up -- is a backend-health fact
+        that the index path merely happened to observe first, not an index
+        outcome. That must open the breaker too, or a dead worker discovered
+        only via indexing strands serving CLOSED with nothing watching it
+        (see F1 in the redesign follow-up). R5: never starts a worker here.
+        """
         with self._lock:
             if not self._is_alive():
-                logger.warning("ChromaDB worker died — restarting...")
-                try:
-                    self._start_worker()
-                except Exception as exc:
-                    logger.error("Worker restart failed: %s — disabling vector search", exc)
-                    self._available = False
-                    return None
+                self._last_index_error = "Worker is not running"
+                logger.error("Worker index call failed: worker not running — "
+                             "indexing degraded, serving unaffected")
+                self._record_backend_failure(WorkerBackendError("worker process is not alive"))
+                return None
             try:
-                return self._rpc(method, params)
-            except RuntimeError as exc:
-                logger.error("Worker call failed (%s) — restarting once", exc)
-                self._terminate()
-                try:
-                    self._start_worker()
-                    return self._rpc(method, params)
-                except Exception as exc2:
-                    logger.error("Worker retry failed: %s — disabling vector search", exc2)
-                    self._available = False
-                    return None
+                result = self._rpc("index", params)
+            except WorkerRequestError as exc:
+                logger.warning("Worker index request error: %s", exc)
+                self._last_index_error = str(exc)
+                return None
+            except Exception as exc:
+                self._last_index_error = str(exc)
+                logger.error("Worker index call failed (%s) — indexing degraded, "
+                             "serving unaffected", exc)
+                if not self._is_alive():
+                    self._record_backend_failure(exc)
+                return None
+        return result
+
+    def call(self, method: str, params: dict) -> Any:
+        if method == "index":
+            return self._call_index(params)
+        return self._call_query(method, params)
+
+    def breaker_status(self) -> Dict[str, Any]:
+        """R8: plain-dict snapshot for /health/vector."""
+        with self._state_lock:
+            state = self._state
+            failures = self._consecutive_failures
+            return {
+                "state": state,
+                "epoch": self._epoch,
+                "generation": self._generation,
+                "consecutive_failures": failures,
+                "next_probe_in_s": self._backoff_base_delay(failures) if state == self._OPEN else None,
+                # G2: a monitor's alert on "RECOVERING/OPEN for > 5min" is the
+                # signature of a wedged supervisor -- the wedged-readline bug
+                # left no other observable trace (no exception, no log spam).
+                "state_age_s": time.monotonic() - self._state_since,
+                "last_error": self._last_error,
+                "last_index_error": self._last_index_error,
+                "served_collections": list(self._served_collections),
+            }
 
     def shutdown(self) -> None:
+        with self._state_lock:
+            self._set_state(self._STOPPED)
+        self._wake.set()
+        if self._supervisor is not None:
+            self._supervisor.join(timeout=30)
+            if self._supervisor.is_alive():
+                logger.warning("Worker supervisor did not exit within shutdown timeout")
         with self._lock:
             self._terminate()
-            self._available = False
 
 
 # ---------------------------------------------------------------------------

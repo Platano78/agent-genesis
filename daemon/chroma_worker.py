@@ -44,12 +44,64 @@ def _write(payload: dict) -> None:
     sys.stdout.flush()
 
 
-def respond_ok(req_id: str, result) -> None:
-    _write({"id": req_id, "result": result})
+def respond_ok(req_id: str, result, gen=None) -> None:
+    _write({"id": req_id, "result": result, "gen": gen})
 
 
-def respond_err(req_id: str, error: str) -> None:
-    _write({"id": req_id, "error": error})
+def respond_err(req_id: str, error: str, gen=None, error_kind: str = "backend") -> None:
+    # error_kind classifies parent-side breaker treatment: "request" (bad
+    # params, unknown method) never touches breaker health; "backend"
+    # (default, fail-safe) always does. See docs/plans/worker-breaker-redesign.md R4.
+    _write({"id": req_id, "error": error, "gen": gen, "error_kind": error_kind})
+
+
+MANIFEST_VERSION = "1"
+
+
+def _resolve_manifest(embedding_model: str) -> dict:
+    return {
+        "ag_embedding_model": embedding_model,
+        "ag_query_prefix": os.environ.get("EMBEDDING_QUERY_PREFIX", ""),
+        "ag_manifest_version": MANIFEST_VERSION,
+    }
+
+
+def open_verified_collection(client, chroma_name: str, ef, embedding_model: str):
+    """Get or create a collection, enforcing the embedding-model manifest.
+
+    On creation, stamps the collection with a manifest recording which model
+    produced its vectors. On reopen, a mismatched manifest means the volume
+    holds vectors from a different embedding model than the one currently
+    resolved -- serving it would silently mix incompatible vector spaces, so
+    it is refused (returns None) rather than served wrong. A collection with
+    no manifest at all (pre-existing index, indexed before this check existed)
+    is served unverified -- we cannot know what produced those vectors, and
+    refusing it would break the currently deployed index.
+    """
+    manifest = _resolve_manifest(embedding_model)
+    try:
+        col = client.get_collection(chroma_name, embedding_function=ef)
+    except Exception:
+        col = client.create_collection(chroma_name, embedding_function=ef, metadata=manifest)
+        logger.info(
+            "Created collection %s with embedding manifest (model=%s)", chroma_name, embedding_model
+        )
+        return col
+
+    existing_model = (col.metadata or {}).get("ag_embedding_model")
+    if existing_model is None:
+        logger.warning(
+            "Collection %s has no embedding manifest (pre-existing index) -- "
+            "proceeding unverified against resolved model=%s", chroma_name, embedding_model
+        )
+        return col
+    if existing_model != embedding_model:
+        logger.error(
+            "Collection %s embedding manifest mismatch: manifest model=%s, resolved model=%s "
+            "-- refusing to serve this collection", chroma_name, existing_model, embedding_model
+        )
+        return None
+    return col
 
 
 def main() -> None:
@@ -90,24 +142,22 @@ def main() -> None:
 
         # Load beta collection (small, works fine)
         try:
-            beta = client.get_or_create_collection(
-                "beta_claude_desktop", embedding_function=ef
-            )
-            # Verify it works with a quick count
-            beta_count = beta.count()
-            collections["beta"] = beta
-            logger.info("beta collection loaded: %d documents", beta_count)
+            beta = open_verified_collection(client, "beta_claude_desktop", ef, embedding_model)
+            if beta is not None:
+                # Verify it works with a quick count
+                beta_count = beta.count()
+                collections["beta"] = beta
+                logger.info("beta collection loaded: %d documents", beta_count)
         except Exception as exc:
             logger.error("Failed to load beta collection: %s", exc)
 
         # Load alpha collection (rebuilt from 2M+ to ~35K docs, segfault fixed)
         try:
-            alpha = client.get_or_create_collection(
-                "alpha_claude_code", embedding_function=ef
-            )
-            alpha_count = alpha.count()
-            collections["alpha"] = alpha
-            logger.info("alpha collection loaded: %d documents", alpha_count)
+            alpha = open_verified_collection(client, "alpha_claude_code", ef, embedding_model)
+            if alpha is not None:
+                alpha_count = alpha.count()
+                collections["alpha"] = alpha
+                logger.info("alpha collection loaded: %d documents", alpha_count)
         except Exception as exc:
             logger.warning("Failed to load alpha collection: %s — FTS5 fallback", exc)
 
@@ -134,20 +184,26 @@ def main() -> None:
         req_id = req.get("id", "unknown")
         method = req.get("method", "")
         params = req.get("params", {})
+        gen = req.get("gen")
 
         try:
             if method == "ping":
-                respond_ok(req_id, "pong")
+                respond_ok(req_id, "pong", gen)
             elif method == "query":
-                respond_ok(req_id, _handle_query(params, collections))
+                respond_ok(req_id, _handle_query(params, collections), gen)
             elif method == "index":
-                _handle_index(params, collections, client, ef)
-                respond_ok(req_id, {"indexed": True})
+                _handle_index(params, collections, client, ef, embedding_model)
+                respond_ok(req_id, {"indexed": True}, gen)
             else:
-                respond_err(req_id, f"Unknown method: {method!r}")
+                respond_err(req_id, f"Unknown method: {method!r}", gen, error_kind="request")
+        except ValueError as exc:
+            # Malformed client request (e.g. empty query_text) -- must never
+            # open a backend-health breaker for everyone else.
+            logger.warning("Request error in method %r: %s", method, exc)
+            respond_err(req_id, str(exc), gen, error_kind="request")
         except Exception as exc:
             logger.error("Error in method %r: %s", method, exc, exc_info=True)
-            respond_err(req_id, str(exc))
+            respond_err(req_id, str(exc), gen, error_kind="backend")
 
 
 def _handle_query(params: dict, collections: dict) -> dict:
@@ -165,6 +221,7 @@ def _handle_query(params: dict, collections: dict) -> dict:
     where = {"project": project_filter} if project_filter else None
 
     results = []
+    served_collections = []
     for col_name in col_names:
         if col_name not in collections:
             logger.debug("Collection %r not available for vector search, skipping", col_name)
@@ -174,6 +231,7 @@ def _handle_query(params: dict, collections: dict) -> dict:
             n_results=n_results,
             where=where,
         )
+        served_collections.append(col_name)
         for i in range(len(res["ids"][0])):
             results.append({
                 "id": res["ids"][0][i],
@@ -183,10 +241,18 @@ def _handle_query(params: dict, collections: dict) -> dict:
                 "collection": col_name,
             })
     results.sort(key=lambda x: x["distance"])
-    return {"results": results[:n_results], "total_matches": len(results)}
+    # served_collections lets the parent's probe distinguish "genuinely
+    # queried, zero hits" from "collection wasn't served at all" (defect 6) --
+    # a collection that failed to load looks identical to a real empty result
+    # unless this is reported separately.
+    return {
+        "results": results[:n_results],
+        "total_matches": len(results),
+        "served_collections": served_collections,
+    }
 
 
-def _handle_index(params: dict, collections: dict, client, ef) -> None:
+def _handle_index(params: dict, collections: dict, client, ef, embedding_model: str) -> None:
     """Index a conversation into the appropriate collection."""
     conv = params.get("conversation", {})
     collection = params.get("collection", "auto")
@@ -208,7 +274,11 @@ def _handle_index(params: dict, collections: dict, client, ef) -> None:
         target = collections[collection]
     else:
         # Create/get collection for indexing even if not used for search
-        target = client.get_or_create_collection(chroma_name, embedding_function=ef)
+        target = open_verified_collection(client, chroma_name, ef, embedding_model)
+        if target is None:
+            raise ValueError(
+                f"Refusing to index into {chroma_name!r}: embedding manifest mismatch"
+            )
 
     conversation_id = conv.get("id", str(uuid.uuid4()))
     conv_meta = {
