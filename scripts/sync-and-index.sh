@@ -120,6 +120,44 @@ log "Polling /index/status for completion (timeout ${INDEX_POLL_MAX}s)"
 INDEX_STATE=$(poll_index_status)
 log "Indexing finished state: $INDEX_STATE"
 
+# --- Post-index verification --------------------------------------------------
+# 2026-08-17: a nightly index blew the worker RPC deadline, the parent latched
+# vector search off, and /search served keyword-only for 5 hours behind an HTTP
+# 200 and a healthy container. `/index/status: complete` was true the whole time.
+#
+# A completed index is NOT evidence that search still works. Verify the thing
+# that actually broke: the vector arm. Non-fatal — this reports, it does not
+# abort the run, because the corpus sync already succeeded by this point.
+verify_vector_arm() {
+  local vec_code search_type
+
+  vec_code=$(ssh -o ConnectTimeout=5 "$REMOTE_HOST" \
+    "curl -s -o /dev/null -w '%{http_code}' -m 20 $REMOTE_API_URL/health/vector" 2>/dev/null || echo "000")
+
+  search_type=$(ssh -o ConnectTimeout=5 "$REMOTE_HOST" \
+    "curl -s -m 30 -X POST $REMOTE_API_URL/search -H 'Content-Type: application/json' -d '{\"query\":\"docker\",\"n_results\":3}'" 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('search_type','?'))" 2>/dev/null || echo "unreachable")
+
+  if [ "$vec_code" = "200" ] && [ "$search_type" = "hybrid" ]; then
+    log "Vector arm OK (/health/vector 200, search_type=hybrid)"
+    return 0
+  fi
+
+  log "ALERT: vector search is DEGRADED after indexing"
+  log "  /health/vector = ${vec_code} (want 200)"
+  log "  search_type    = ${search_type} (want 'hybrid'; 'fts5' means keyword-only)"
+  log "  The API still answers and the container still looks healthy — that is"
+  log "  precisely how this hid for 5 hours on 2026-08-17."
+  log "  Inspect: curl \$API/health/vector | python3 -m json.tool   (see .breaker.state)"
+  return 1
+}
+
+if [ "$INDEX_STATE" = "complete" ] || [ "$INDEX_STATE" = "no_job" ]; then
+  verify_vector_arm || true
+else
+  log "Skipping vector verification (indexing state: $INDEX_STATE)"
+fi
+
 # 2026-06-09: graph audit found ~90% of extracted edges were similarity noise
 # (threshold 0.7, no per-node cap). Graph pruned 249->102 nodes / 15k->712
 # edges; extractor fixed same day (default threshold now env/0.85, max 5
