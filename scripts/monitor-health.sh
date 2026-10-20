@@ -3,8 +3,10 @@
 # Run via cron: */5 * * * * /path/to/monitor-health.sh
 
 HEALTH_URL="http://localhost:8080/health"
-LOG_FILE="/home/platano/project/agent-genesis/logs/health-monitor.log"
-ALERT_FILE="/home/platano/project/agent-genesis/logs/alerts.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$(dirname "$SCRIPT_DIR")/logs"
+LOG_FILE="$LOG_DIR/health-monitor.log"
+ALERT_FILE="$LOG_DIR/alerts.log"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 

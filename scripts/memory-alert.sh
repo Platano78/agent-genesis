@@ -4,7 +4,7 @@
 # Usage: ./memory-alert.sh [threshold_percent]
 #
 # Add to cron for proactive monitoring:
-# */10 * * * * /home/platano/project/agent-genesis/scripts/memory-alert.sh 80
+# */10 * * * * /path/to/agent-genesis/scripts/memory-alert.sh 80
 
 set -euo pipefail
 

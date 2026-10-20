@@ -1,6 +1,6 @@
 #!/bin/bash
 # Agent Genesis Health Check Script
-# Run every 5 minutes via cron: */5 * * * * /home/platano/project/agent-genesis/scripts/health-check.sh
+# Run every 5 minutes via cron: */5 * * * * /path/to/agent-genesis/scripts/health-check.sh
 
 set -euo pipefail
 
