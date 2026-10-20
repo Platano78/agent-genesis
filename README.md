@@ -506,6 +506,8 @@ MIT License - see [LICENSE](LICENSE)
 - The MCP server now reports its real version; it had announced `1.3.0` since v1.3.0
 - `scripts/monitor-health.sh` writes its logs next to the checkout instead of a hard-coded
   developer path, so it works on any machine; cron examples use a placeholder path
+- The PyPI wheel contains only the three runtime modules. It shipped the whole `mcp-server/`
+  directory with `./`-prefixed member paths, which PyPI now rejects
 
 ### v1.7.0 (2026-08-17)
 - Redesign the ChromaDB worker circuit breaker. A long-running index batch could blow the
