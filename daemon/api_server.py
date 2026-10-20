@@ -20,11 +20,24 @@ from typing import Optional
 try:
     from daemon.knowledge_db_dual import DualSourceKnowledgeDB
     from daemon.indexer import ConversationIndexer
+    from daemon.conversation_chunker import strip_context_header
 except ImportError:
     from knowledge_db_dual import DualSourceKnowledgeDB
     from indexer import ConversationIndexer
+    from conversation_chunker import strip_context_header
 
 logger = logging.getLogger(__name__)
+
+
+def present_search_results(results: list) -> list:
+    """Search results as callers see them: the chunker's context header,
+    which exists for retrieval, is stripped from each returned document."""
+    presented = []
+    for r in results:
+        if isinstance(r.get("document"), str):
+            r = {**r, "document": strip_context_header(r["document"])}
+        presented.append(r)
+    return presented
 
 _indexing_lock = threading.Lock()
 _current_job: Optional[dict] = None
@@ -180,7 +193,7 @@ class APIHandler(BaseHTTPRequestHandler):
             )
 
             # Unpack result dict from query_unified
-            results_list = result.get("results", [])
+            results_list = present_search_results(result.get("results", []))
             self.send_json_response({
                 "query": query_text,
                 "results_count": len(results_list),

@@ -8,6 +8,7 @@ Designed for all-MiniLM-L6-v2 (256 token max sequence, ~920 chars).
 """
 
 import hashlib
+import re
 from datetime import datetime
 from typing import List, Tuple
 
@@ -15,6 +16,18 @@ MAX_CHUNK_CHARS = 920
 MAX_FULL_TEXT_CHARS = 10_000
 MAX_PREVIEW_CHARS = 500
 MAX_TURN_PARTS = 6  # bound the split-instead-of-truncate explosion per turn
+
+# The header is embedded in the indexed text (it is what makes a split
+# fragment retrievable on its own) but it is index plumbing, not content:
+# search responses strip it so it does not eat the caller's snippet budget.
+# The topic has its newlines flattened, so the header is always one line.
+_CONTEXT_HEADER = "[Turn {turn_idx} continued — topic: {topic}]\n"
+_CONTEXT_HEADER_RE = re.compile(r"\A\[Turn \d+ continued — topic: [^\n]*\]\n")
+
+
+def strip_context_header(document: str) -> str:
+    """Remove the chunker's leading context header, if present."""
+    return _CONTEXT_HEADER_RE.sub("", document, count=1)
 TRUNCATION_MARKER = "…[truncated]"
 
 
@@ -28,7 +41,7 @@ def _split_turn_doc(full_doc: str, turn_idx: int, user_text: str) -> List[str]:
     topic = user_text.strip().replace("\n", " ")[:80]
     if len(user_text.strip()) > 80:
         topic += "…"
-    header = f"[Turn {turn_idx} continued — topic: {topic}]\n"
+    header = _CONTEXT_HEADER.format(turn_idx=turn_idx, topic=topic)
     budget = MAX_CHUNK_CHARS - len(header)
     if budget <= 0:
         header = ""
