@@ -496,6 +496,15 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Changelog
 
+### v1.7.1 (2026-10-20)
+- Strip the chunker's `[Turn N continued — topic: …]` context header from `/search` results.
+  Split turns carry it so a fragment is retrievable on its own, but it was returned inside
+  every result document and ate the caller's snippet budget. The index and document ids are
+  unchanged; only the response is cleaned
+- `scripts/sync-and-index.sh` verifies the vector arm after indexing (`/health/vector` 200 and
+  `search_type: hybrid`) instead of trusting job status, and logs an ALERT when it is degraded
+- The MCP server now reports its real version; it had announced `1.3.0` since v1.3.0
+
 ### v1.7.0 (2026-08-17)
 - Redesign the ChromaDB worker circuit breaker. A long-running index batch could blow the
   RPC deadline and latch vector search off **permanently** — searches silently degraded to
